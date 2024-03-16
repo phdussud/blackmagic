@@ -36,9 +36,8 @@ void platform_pace_poll(void);
 #else
 void platform_init(void);
 
-inline void platform_pace_poll(void)
-{
-}
+void platform_pace_poll(void);
+
 #endif
 
 typedef struct platform_timeout platform_timeout_s;
