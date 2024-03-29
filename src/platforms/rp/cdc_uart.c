@@ -136,7 +136,8 @@ static void dma_handler()
 	if (ints & (1 << tx_dma_channel)) //(dma_channel_hw_addr(tx_dma_channel)->transfer_count == 0) // (dma_channel_get_irq1_status(tx_dma_channel))
 	{
 		uint8_t *ra = (uint8_t *)(dma_channel_hw_addr(tx_dma_channel)->read_addr);
-		size_t space = (tx_write_address >= ra) ? (tx_write_address - ra) : (tx_write_address + TX_BUFFER_SIZE - ra);
+		uint8_t *l_tx_write_address = (uint8_t *)tx_write_address;
+		size_t space =	(l_tx_write_address >= ra) ? (l_tx_write_address - ra) : (l_tx_write_address + TX_BUFFER_SIZE - ra);
 		if (space > 0)
 			dma_channel_set_trans_count(tx_dma_channel, space, true);
 	}
@@ -183,7 +184,7 @@ void cdc_task(void)
 			size_t tx_len;
 			tx_len = tud_cdc_n_read(UART_PORT_ITF, (void*)tx_write_address, watermark);
 			//be careful about modifying tx_write_address as it is used in the IRQ handler
-			volatile uint8_t *l_tx_write_address = tx_write_address + tx_len;
+			uint8_t *l_tx_write_address = (uint8_t *)(tx_write_address + tx_len);
 			if (l_tx_write_address >= &tx_buf[TX_BUFFER_SIZE])
 				tx_write_address = l_tx_write_address - TX_BUFFER_SIZE;
 			else
@@ -193,7 +194,8 @@ void cdc_task(void)
 			{
 				uint8_t *ra = (uint8_t *)(dma_channel_hw_addr(tx_dma_channel)->read_addr);
 				size_t space = (tx_write_address >= ra) ? (tx_write_address - ra) : (tx_write_address + TX_BUFFER_SIZE - ra);
-				dma_channel_set_trans_count(tx_dma_channel, space, true);
+				if (space > 0)
+					dma_channel_set_trans_count(tx_dma_channel, space, true);
 			}
 		}
 	}
