@@ -27,21 +27,24 @@
 #include "platform_support.h"
 #include "target_probe.h"
 
-#define TOPT_INHIBIT_NRST           (1U << 0U)
-#define TOPT_IN_SEMIHOSTING_SYSCALL (1U << 31U)
+#define TOPT_INHIBIT_NRST           (1U << 0U)  /* Target misbehaves if reset using nRST line */
+#define TOPT_NON_HALTING_MEM_IO     (1U << 30U) /* Target does not need halting for memory I/O */
+#define TOPT_IN_SEMIHOSTING_SYSCALL (1U << 31U) /* Target is currently in a semihosting syscall */
 
 extern target_s *target_list;
 
 typedef enum flash_operation {
 	FLASH_OPERATION_NONE,
 	FLASH_OPERATION_ERASE,
+	FLASH_OPERATION_MASS_ERASE,
 	FLASH_OPERATION_WRITE,
 } flash_operation_e;
 
 typedef struct target_ram target_ram_s;
 
 struct target_ram {
-	target_addr_t start;
+	/* XXX: This needs adjusting for 64-bit operations */
+	target_addr32_t start;
 	size_t length;
 	target_ram_s *next;
 };
@@ -50,28 +53,36 @@ typedef struct target_flash target_flash_s;
 
 typedef bool (*flash_prepare_func)(target_flash_s *flash);
 typedef bool (*flash_erase_func)(target_flash_s *flash, target_addr_t addr, size_t len);
+typedef bool (*flash_mass_erase_func)(target_flash_s *flash, platform_timeout_s *print_progess);
 typedef bool (*flash_write_func)(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
 typedef bool (*flash_done_func)(target_flash_s *flash);
 
 struct target_flash {
-	target_s *t;                 /* Target this flash is attached to */
-	target_addr_t start;         /* Start address of flash */
-	size_t length;               /* Flash length */
-	size_t blocksize;            /* Erase block size */
-	size_t writesize;            /* Write operation size, must be <= blocksize/writebufsize */
-	size_t writebufsize;         /* Size of write buffer, this is calculated and not set in target code */
-	uint8_t erased;              /* Byte erased state */
-	uint8_t operation;           /* Current Flash operation (none means it's idle/unprepared) */
-	flash_prepare_func prepare;  /* Prepare for flash operations */
-	flash_erase_func erase;      /* Erase a range of flash */
-	flash_write_func write;      /* Write to flash */
-	flash_done_func done;        /* Finish flash operations */
-	uint8_t *buf;                /* Buffer for flash operations */
-	target_addr_t buf_addr_base; /* Address of block this buffer is for */
-	target_addr_t buf_addr_low;  /* Address of lowest byte written */
-	target_addr_t buf_addr_high; /* Address of highest byte written */
-	target_flash_s *next;        /* Next flash in list */
+	/* XXX: This needs adjusting for 64-bit operations */
+	target_s *t;                      /* Target this flash is attached to */
+	target_addr32_t start;            /* Start address of flash */
+	size_t length;                    /* Flash length */
+	size_t blocksize;                 /* Erase block size */
+	size_t writesize;                 /* Write operation size, must be <= blocksize/writebufsize */
+	size_t writebufsize;              /* Size of write buffer, this is calculated and not set in target code */
+	uint8_t erased;                   /* Byte erased state */
+	uint8_t operation;                /* Current Flash operation (none means it's idle/unprepared) */
+	flash_prepare_func prepare;       /* Prepare for flash operations */
+	flash_erase_func erase;           /* Erase a range of flash */
+	flash_mass_erase_func mass_erase; /* Mass erase flash (this flash only¹) */
+	flash_write_func write;           /* Write to flash */
+	flash_done_func done;             /* Finish flash operations */
+	uint8_t *buf;                     /* Buffer for flash operations */
+	target_addr32_t buf_addr_base;    /* Address of block this buffer is for */
+	target_addr32_t buf_addr_low;     /* Address of lowest byte written */
+	target_addr32_t buf_addr_high;    /* Address of highest byte written */
+	target_flash_s *next;             /* Next flash in list */
 };
+
+/*
+ * ¹the mass_erase method must not cause any side effects outside the scope/address space of the flash 
+ * consider using the target mass_erase method instead for such cases
+ */
 
 typedef bool (*cmd_handler_fn)(target_s *target, int argc, const char **argv);
 
@@ -92,9 +103,10 @@ struct target_command {
 typedef struct breakwatch breakwatch_s;
 
 struct breakwatch {
+	/* XXX: This needs adjusting for 64-bit operations */
 	breakwatch_s *next;
 	target_breakwatch_e type;
-	target_addr_t addr;
+	target_addr32_t addr;
 	size_t size;
 	uint32_t reserved[4]; /* For use by the implementing driver */
 };
@@ -110,8 +122,8 @@ struct target {
 	bool (*check_error)(target_s *target);
 
 	/* Memory access functions */
-	void (*mem_read)(target_s *target, void *dest, target_addr_t src, size_t len);
-	void (*mem_write)(target_s *target, target_addr_t dest, const void *src, size_t len);
+	void (*mem_read)(target_s *target, void *dest, target_addr64_t src, size_t len);
+	void (*mem_write)(target_s *target, target_addr64_t dest, const void *src, size_t len);
 
 	/* Register access functions */
 	size_t regs_size;
@@ -134,12 +146,11 @@ struct target {
 	breakwatch_s *bw_list;
 
 	/* Recovery functions */
-	bool (*mass_erase)(target_s *target);
+	bool (*mass_erase)(target_s *target, platform_timeout_s *print_progess); /* Mass erase all target flash */
 
 	/* Flash functions */
 	bool (*enter_flash_mode)(target_s *target);
 	bool (*exit_flash_mode)(target_s *target);
-	bool flash_mode;
 
 	/* Target-defined options */
 	uint32_t target_options;
@@ -150,6 +161,9 @@ struct target {
 		bool unsafe_enabled;
 		bool ke04_mode;
 	};
+
+	bool attached;
+	bool flash_mode;
 
 	target_ram_s *ram;
 	target_flash_s *flash;
@@ -175,8 +189,6 @@ struct target {
 	 * fallback to AP partno
 	 */
 	uint16_t part_id;
-
-	bool attached;
 };
 
 void target_print_progress(platform_timeout_s *timeout);
@@ -184,21 +196,39 @@ void target_ram_map_free(target_s *target);
 void target_flash_map_free(target_s *target);
 void target_mem_map_free(target_s *target);
 void target_add_commands(target_s *target, const command_s *cmds, const char *name);
-void target_add_ram(target_s *target, target_addr_t start, uint32_t len);
+void target_add_ram32(target_s *target, target_addr32_t start, uint32_t len);
+void target_add_ram64(target_s *target, target_addr64_t start, uint64_t len);
 void target_add_flash(target_s *target, target_flash_s *flash);
+
+/* No-op stub for enter flash mode */
+bool target_enter_flash_mode_stub(target_s *target);
 
 target_flash_s *target_flash_for_addr(target_s *target, uint32_t addr);
 
 /* Convenience function for MMIO access */
-uint32_t target_mem_read32(target_s *target, uint32_t addr);
-uint16_t target_mem_read16(target_s *target, uint32_t addr);
-uint8_t target_mem_read8(target_s *target, uint32_t addr);
-void target_mem_write32(target_s *target, uint32_t addr, uint32_t value);
-void target_mem_write16(target_s *target, uint32_t addr, uint16_t value);
-void target_mem_write8(target_s *target, uint32_t addr, uint8_t value);
+uint32_t target_mem32_read32(target_s *target, target_addr32_t addr);
+uint16_t target_mem32_read16(target_s *target, target_addr32_t addr);
+uint8_t target_mem32_read8(target_s *target, target_addr32_t addr);
+bool target_mem32_write32(target_s *target, target_addr32_t addr, uint32_t value);
+bool target_mem32_write16(target_s *target, target_addr32_t addr, uint16_t value);
+bool target_mem32_write8(target_s *target, target_addr32_t addr, uint8_t value);
+uint32_t target_mem64_read32(target_s *target, target_addr64_t addr);
+uint16_t target_mem64_read16(target_s *target, target_addr64_t addr);
+uint8_t target_mem64_read8(target_s *target, target_addr64_t addr);
+bool target_mem64_write32(target_s *target, target_addr64_t addr, uint32_t value);
+bool target_mem64_write16(target_s *target, target_addr64_t addr, uint16_t value);
+bool target_mem64_write8(target_s *target, target_addr64_t addr, uint8_t value);
 bool target_check_error(target_s *target);
 
+#if defined(__MINGW32__) || defined(__MINGW64__) || defined(__CYGWIN__)
+#define TC_FORMAT_ATTR __attribute__((format(__MINGW_PRINTF_FORMAT, 2, 3)))
+#elif defined(__GNUC__) || defined(__clang__)
+#define TC_FORMAT_ATTR __attribute__((format(printf, 2, 3)))
+#else
+#define TC_FORMAT_ATTR
+#endif
+
 /* Access to host controller interface */
-void tc_printf(target_s *target, const char *fmt, ...);
+void tc_printf(target_s *target, const char *fmt, ...) TC_FORMAT_ATTR;
 
 #endif /* TARGET_TARGET_INTERNAL_H */

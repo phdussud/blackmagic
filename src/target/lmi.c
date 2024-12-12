@@ -102,7 +102,6 @@
 
 static bool lmi_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
 static bool lmi_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
-static bool lmi_mass_erase(target_s *target);
 
 static const uint16_t lmi_flash_write_stub[] = {
 #include "flashstub/lmi.stub"
@@ -130,18 +129,17 @@ bool lm3s_probe(target_s *const target, const uint16_t did1)
 	switch (did1) {
 	case DID1_LM3S3748:
 	case DID1_LM3S5732:
-		target_add_ram(target, 0x20000000U, 0x10000U);
+		target_add_ram32(target, 0x20000000U, 0x10000U);
 		lmi_add_flash(target, 0x20000U);
 		break;
 	case DID1_LM3S8962:
-		target_add_ram(target, 0x2000000U, 0x10000U);
+		target_add_ram32(target, 0x2000000U, 0x10000U);
 		lmi_add_flash(target, 0x40000U);
 		break;
 	default:
 		return false;
 	}
 	target->driver = "Stellaris";
-	target->mass_erase = lmi_mass_erase;
 	return true;
 }
 
@@ -149,7 +147,7 @@ bool tm4c_probe(target_s *const target, const uint16_t did1)
 {
 	switch (did1) {
 	case DID1_TM4C123GH6PM:
-		target_add_ram(target, 0x20000000, 0x10000);
+		target_add_ram32(target, 0x20000000, 0x10000);
 		lmi_add_flash(target, 0x80000);
 		/*
 		 * On Tiva targets, asserting nRST results in the debug
@@ -159,17 +157,17 @@ bool tm4c_probe(target_s *const target, const uint16_t did1)
 		target->target_options |= TOPT_INHIBIT_NRST;
 		break;
 	case DID1_TM4C1230C3PM:
-		target_add_ram(target, 0x20000000, 0x6000);
+		target_add_ram32(target, 0x20000000, 0x6000);
 		lmi_add_flash(target, 0x10000);
 		target->target_options |= TOPT_INHIBIT_NRST;
 		break;
 	case DID1_TM4C1294KCPDT:
-		target_add_ram(target, 0x20000000, 0x40000);
+		target_add_ram32(target, 0x20000000, 0x40000);
 		lmi_add_flash(target, 0x80000);
 		target->target_options |= TOPT_INHIBIT_NRST;
 		break;
 	case DID1_TM4C1294NCPDT:
-		target_add_ram(target, 0x20000000, 0x40000);
+		target_add_ram32(target, 0x20000000, 0x40000);
 		lmi_add_flash(target, 0x100000);
 		target->target_options |= TOPT_INHIBIT_NRST;
 		break;
@@ -177,15 +175,14 @@ bool tm4c_probe(target_s *const target, const uint16_t did1)
 		return false;
 	}
 	target->driver = "Tiva-C";
-	target->mass_erase = lmi_mass_erase;
 	cortex_ap(target)->dp->quirks |= ADIV5_DP_QUIRK_DUPED_AP;
 	return true;
 }
 
 bool lmi_probe(target_s *const target)
 {
-	const uint32_t did0 = target_mem_read32(target, LMI_SCB_DID0);
-	const uint16_t did1 = target_mem_read32(target, LMI_SCB_DID1) >> 16U;
+	const uint32_t did0 = target_mem32_read32(target, LMI_SCB_DID0);
+	const uint16_t did1 = target_mem32_read32(target, LMI_SCB_DID1) >> 16U;
 
 	switch (did0 & DID0_CLASS_MASK) {
 	case DID0_CLASS_STELLARIS_FURY:
@@ -209,10 +206,10 @@ static bool lmi_flash_erase(target_flash_s *flash, target_addr_t addr, const siz
 	platform_timeout_set(&timeout, 500);
 
 	for (size_t erased = 0; erased < len; erased += BLOCK_SIZE) {
-		target_mem_write32(target, LMI_FLASH_FMA, addr);
-		target_mem_write32(target, LMI_FLASH_FMC, LMI_FLASH_FMC_WRKEY | LMI_FLASH_FMC_ERASE);
+		target_mem32_write32(target, LMI_FLASH_FMA, addr);
+		target_mem32_write32(target, LMI_FLASH_FMC, LMI_FLASH_FMC_WRKEY | LMI_FLASH_FMC_ERASE);
 
-		while (target_mem_read32(target, LMI_FLASH_FMC) & LMI_FLASH_FMC_ERASE) {
+		while (target_mem32_read32(target, LMI_FLASH_FMC) & LMI_FLASH_FMC_ERASE) {
 			if (full_erase)
 				target_print_progress(&timeout);
 		}
@@ -229,15 +226,10 @@ static bool lmi_flash_write(target_flash_s *flash, target_addr_t dest, const voi
 {
 	target_s *target = flash->t;
 	target_check_error(target);
-	target_mem_write(target, SRAM_BASE, lmi_flash_write_stub, sizeof(lmi_flash_write_stub));
-	target_mem_write(target, STUB_BUFFER_BASE, src, len);
+	target_mem32_write(target, SRAM_BASE, lmi_flash_write_stub, sizeof(lmi_flash_write_stub));
+	target_mem32_write(target, STUB_BUFFER_BASE, src, len);
 	if (target_check_error(target))
 		return false;
 
 	return cortexm_run_stub(target, SRAM_BASE, dest, STUB_BUFFER_BASE, len, 0) == 0;
-}
-
-static bool lmi_mass_erase(target_s *target)
-{
-	return lmi_flash_erase(target->flash, target->flash->start, target->flash->length);
 }

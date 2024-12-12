@@ -30,6 +30,7 @@
 #include "remote/protocol_v1.h"
 #include "remote/protocol_v2.h"
 #include "remote/protocol_v3.h"
+#include "remote/protocol_v4.h"
 
 #ifndef _MSC_VER
 #include <sys/time.h>
@@ -95,6 +96,10 @@ bool remote_init(const bool power_up)
 		case 3:
 			remote_v3_init();
 			break;
+		case 4:
+			if (!remote_v4_init())
+				return false;
+			break;
 		default:
 			DEBUG_ERROR("Unknown remote protocol version %" PRIu64 ", aborting\n", version);
 			return false;
@@ -149,7 +154,7 @@ bool remote_nrst_get_val(void)
 	platform_buffer_write(buffer, length);
 	length = platform_buffer_read(buffer, REMOTE_MAX_MSG_SIZE);
 	if (length < 1 || buffer[0] == REMOTE_RESP_ERR) {
-		DEBUG_ERROR("platform_nrst_set_val failed, error %s\n", length ? buffer + 1 : "unknown");
+		DEBUG_ERROR("platform_nrst_get_val failed, error %s\n", length ? buffer + 1 : "unknown");
 		exit(-1);
 	}
 	return buffer[1] == '1';
@@ -203,7 +208,26 @@ bool remote_swd_init(void)
 
 void remote_adiv5_dp_init(adiv5_debug_port_s *const dp)
 {
-	remote_funcs.adiv5_init(dp);
+	if (remote_funcs.adiv5_init)
+		remote_funcs.adiv5_init(dp);
+}
+
+void remote_adiv6_dp_init(adiv5_debug_port_s *const dp)
+{
+	/* Try to initialise ADIv6 acceleration */
+	if (remote_funcs.adiv6_init)
+		remote_funcs.adiv6_init(dp);
+	/* If we cannot, but we did initialise ADIv5, adjust the memory I/O functions so the ADIv6 APs work */
+	else if (remote_funcs.adiv5_init) {
+		dp->mem_read = adiv5_mem_read_bytes;
+		dp->mem_write = adiv5_mem_write_bytes;
+	}
+}
+
+void remote_riscv_jtag_dtm_init(riscv_dmi_s *const dmi)
+{
+	if (remote_funcs.riscv_jtag_init)
+		remote_funcs.riscv_jtag_init(dmi);
 }
 
 void remote_add_jtag_dev(uint32_t dev_index, const jtag_dev_s *jtag_dev)

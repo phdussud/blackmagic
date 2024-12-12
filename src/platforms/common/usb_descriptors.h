@@ -32,8 +32,6 @@
 #include "version.h"
 #include "usb_types.h"
 
-#define BOARD_IDENT "Black Magic Probe " PLATFORM_IDENT FIRMWARE_VERSION
-
 /* Top-level device descriptor */
 static const usb_device_descriptor_s dev_desc = {
 	.bLength = USB_DT_DEVICE_SIZE,
@@ -61,13 +59,16 @@ static const usb_device_descriptor_s dev_desc = {
 
 /* GDB interface descriptors */
 
-/* This notification endpoint isn't implemented. According to CDC spec its
- * optional, but its absence causes a NULL pointer dereference in Linux cdc_acm
- * driver. */
+/*
+ * This interrupt endpoint serves to send "DSR+DCD high" serial state
+ * notification to nudge some host drivers to start talking to us.
+ * According to CDC spec it's optional, but its absence may cause
+ * a NULL pointer dereference in Linux cdc_acm driver.
+ */
 static const usb_endpoint_descriptor_s gdb_comm_endp = {
 	.bLength = USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType = USB_DT_ENDPOINT,
-	.bEndpointAddress = (CDCACM_GDB_ENDPOINT + 1U) | USB_REQ_TYPE_IN,
+	.bEndpointAddress = CDCACM_GDB_NOTIF_ENDPOINT | USB_REQ_TYPE_IN,
 	.bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
 	.wMaxPacketSize = 16,
 	.bInterval = USB_MAX_INTERVAL,
@@ -174,10 +175,15 @@ static const usb_iface_assoc_descriptor_s gdb_assoc = {
 
 /* Physical/debug UART interface */
 
+/*
+ * This interrupt endpoint (when available, not on stm32f4) allows BMP to respond
+ * with CDC-ACM Serial state notifications. The only one implemented is DCD+DSR high.
+ * Possible other flags: break condition, RI, errors of framing/parity/overrun.
+ */
 static const usb_endpoint_descriptor_s uart_comm_endp = {
 	.bLength = USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType = USB_DT_ENDPOINT,
-	.bEndpointAddress = (CDCACM_UART_ENDPOINT + 1U) | USB_REQ_TYPE_IN,
+	.bEndpointAddress = CDCACM_UART_NOTIF_ENDPOINT | USB_REQ_TYPE_IN,
 	.bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
 	.wMaxPacketSize = 16,
 	.bInterval = USB_MAX_INTERVAL,
@@ -329,16 +335,16 @@ static const usb_iface_assoc_descriptor_s dfu_assoc = {
 static const usb_endpoint_descriptor_s trace_endp = {
 	.bLength = USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType = USB_DT_ENDPOINT,
-	.bEndpointAddress = TRACE_ENDPOINT | USB_REQ_TYPE_IN,
+	.bEndpointAddress = SWO_ENDPOINT | USB_REQ_TYPE_IN,
 	.bmAttributes = USB_ENDPOINT_ATTR_BULK,
-	.wMaxPacketSize = TRACE_ENDPOINT_SIZE,
+	.wMaxPacketSize = SWO_ENDPOINT_SIZE,
 	.bInterval = 0,
 };
 
 const usb_interface_descriptor_s trace_iface = {
 	.bLength = USB_DT_INTERFACE_SIZE,
 	.bDescriptorType = USB_DT_INTERFACE,
-	.bInterfaceNumber = TRACE_IF_NO,
+	.bInterfaceNumber = SWO_IF_NO,
 	.bAlternateSetting = 0,
 	.bNumEndpoints = 1,
 	.bInterfaceClass = 0xff,
@@ -352,7 +358,7 @@ const usb_interface_descriptor_s trace_iface = {
 static const usb_iface_assoc_descriptor_s trace_assoc = {
 	.bLength = USB_DT_INTERFACE_ASSOCIATION_SIZE,
 	.bDescriptorType = USB_DT_INTERFACE_ASSOCIATION,
-	.bFirstInterface = TRACE_IF_NO,
+	.bFirstInterface = SWO_IF_NO,
 	.bInterfaceCount = 1,
 	.bFunctionClass = 0xff,
 	.bFunctionSubClass = 0xff,
@@ -409,6 +415,10 @@ static const usb_config_descriptor_s config = {
 	.interface = ifaces,
 };
 
+#ifdef PLATFORM_IDENT_DYNAMIC
+#error "Dynamic platform identification not supported by the in-tree USB descriptors at this time"
+#endif
+
 static const char *const usb_strings[] = {
 	"Black Magic Debug",
 	BOARD_IDENT,
@@ -435,7 +445,7 @@ static const char *const usb_strings[] = {
 #define PROPERTY_DEVICE_INTERFACE_GUID u"DeviceInterfaceGUID"
 #define VALUE_DFU_INTERFACE_GUID       u"{76be5ca1-e304-4b32-be5f-d9369d3d201a}"
 #ifdef PLATFORM_HAS_TRACESWO
-#define VALUE_TRACE_INTERFACE_GUID u"{76be5ca1-e305-4b32-be5f-d9369d3d201a}"
+#define VALUE_SWO_INTERFACE_GUID u"{76be5ca1-e305-4b32-be5f-d9369d3d201a}"
 #endif
 
 static const struct {
@@ -490,8 +500,8 @@ static const struct {
 			.wPropertyDataType = REG_SZ,
 			.wPropertyNameLength = ARRAY_LENGTH(PROPERTY_DEVICE_INTERFACE_GUID) * 2U,
 			.PropertyName = PROPERTY_DEVICE_INTERFACE_GUID,
-			.wPropertyDataLength = ARRAY_LENGTH(VALUE_TRACE_INTERFACE_GUID) * 2U,
-			.PropertyData = VALUE_TRACE_INTERFACE_GUID,
+			.wPropertyDataLength = ARRAY_LENGTH(VALUE_SWO_INTERFACE_GUID) * 2U,
+			.PropertyData = VALUE_SWO_INTERFACE_GUID,
 		},
 };
 #endif
@@ -511,7 +521,7 @@ static const microsoft_os_descriptor_function_subset_header microsoft_os_descrip
 	{
 		.wLength = MICROSOFT_OS_DESCRIPTOR_FUNCTION_SUBSET_HEADER_SIZE,
 		.wDescriptorType = MICROSOFT_OS_SUBSET_HEADER_FUNCTION,
-		.bFirstInterface = TRACE_IF_NO,
+		.bFirstInterface = SWO_IF_NO,
 		.bReserved = 0,
 		.wTotalLength = 0,
 
@@ -552,7 +562,7 @@ static const microsoft_os_descriptor_set_information microsoft_os_descriptor_set
 #ifdef PLATFORM_HAS_TRACESWO
 		MICROSOFT_OS_DESCRIPTOR_FUNCTION_SUBSET_HEADER_SIZE + MICROSOFT_OS_FEATURE_COMPATIBLE_ID_DESCRIPTOR_SIZE +
 		MICROSOFT_OS_FEATURE_REGISTRY_PROPERTY_DESCRIPTOR_SIZE_BASE +
-		(ARRAY_LENGTH(PROPERTY_DEVICE_INTERFACE_GUID) * 2U) + (ARRAY_LENGTH(VALUE_TRACE_INTERFACE_GUID) * 2U) +
+		(ARRAY_LENGTH(PROPERTY_DEVICE_INTERFACE_GUID) * 2U) + (ARRAY_LENGTH(VALUE_SWO_INTERFACE_GUID) * 2U) +
 #endif
 		MICROSOFT_OS_DESCRIPTOR_FUNCTION_SUBSET_HEADER_SIZE + MICROSOFT_OS_FEATURE_COMPATIBLE_ID_DESCRIPTOR_SIZE +
 		MICROSOFT_OS_FEATURE_REGISTRY_PROPERTY_DESCRIPTOR_SIZE_BASE +

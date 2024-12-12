@@ -1,7 +1,7 @@
 /*
  * This file is part of the Black Magic Debug project.
  *
- * Copyright (C) 2022-2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2022-2024 1BitSquared <info@1bitsquared.com>
  * Written by Rachel Mant <git@dragonmux.network>
  * All rights reserved.
  *
@@ -48,6 +48,8 @@
 #define DAP_JTAG_TMS_CLEAR   (0U << 6U)
 #define DAP_JTAG_TDO_CAPTURE (1U << 7U)
 
+#define DAP_TRANSFER_STATUS_MASK 0x7U
+
 static size_t dap_encode_transfer(
 	const dap_transfer_request_s *const transfer, uint8_t *const buffer, const size_t offset)
 {
@@ -63,19 +65,19 @@ static size_t dap_encode_transfer(
 
 static void dap_dispatch_status(adiv5_debug_port_s *const dp, const dap_transfer_status_e status)
 {
-	switch (status) {
+	switch (status & DAP_TRANSFER_STATUS_MASK) {
 	case DAP_TRANSFER_OK:
 		break;
 	case DAP_TRANSFER_WAIT:
-		dp->fault = status;
+		dp->fault = status & DAP_TRANSFER_STATUS_MASK;
 		break;
 	case DAP_TRANSFER_FAULT:
 		DEBUG_ERROR("Access resulted in fault\n");
-		dp->fault = status;
+		dp->fault = status & DAP_TRANSFER_STATUS_MASK;
 		break;
 	case DAP_TRANSFER_NO_RESPONSE:
 		DEBUG_ERROR("Access resulted in no response\n");
-		dp->fault = status;
+		dp->fault = status & DAP_TRANSFER_STATUS_MASK;
 		/* If we got no-response, handle the case where the adaptor fails to issue the data phase */
 		if (dap_mode == DAP_CAP_SWD && (dap_quirks & DAP_QUIRK_BAD_SWD_NO_RESP_DATA_PHASE)) {
 			uint32_t response;
@@ -89,7 +91,7 @@ static void dap_dispatch_status(adiv5_debug_port_s *const dp, const dap_transfer
 	}
 }
 
-/* https://www.keil.com/pack/doc/CMSIS/DAP/html/group__DAP__Transfer.html */
+/* https://arm-software.github.io/CMSIS-DAP/latest/group__DAP__Transfer.html */
 bool perform_dap_transfer(adiv5_debug_port_s *const target_dp, const dap_transfer_request_s *const transfer_requests,
 	const size_t requests, uint32_t *const response_data, const size_t responses)
 {
@@ -117,7 +119,7 @@ bool perform_dap_transfer(adiv5_debug_port_s *const target_dp, const dap_transfe
 	}
 
 	/* Look at the response and decipher what went on */
-	if (response.processed == requests && response.status == DAP_TRANSFER_OK) {
+	if (response.processed == requests && (response.status & DAP_TRANSFER_STATUS_MASK) == DAP_TRANSFER_OK) {
 		for (size_t i = 0; i < responses; ++i)
 			response_data[i] = read_le4(response.data[i], 0);
 		return true;
@@ -142,7 +144,7 @@ bool perform_dap_transfer_recoverable(adiv5_debug_port_s *const target_dp,
 	return perform_dap_transfer(target_dp, transfer_requests, requests, response_data, responses);
 }
 
-/* https://www.keil.com/pack/doc/CMSIS/DAP/html/group__DAP__TransferBlock.html */
+/* https://arm-software.github.io/CMSIS-DAP/latest/group__DAP__TransferBlock.html */
 bool perform_dap_transfer_block_read(
 	adiv5_debug_port_s *const target_dp, const uint8_t reg, const uint16_t block_count, uint32_t *const blocks)
 {
@@ -159,24 +161,42 @@ bool perform_dap_transfer_block_read(
 	write_le2(request.block_count, 0, block_count);
 
 	dap_transfer_block_response_read_s response;
+	size_t response_length;
 	/* Run the request having set up the request buffer */
-	if (!dap_run_cmd(&request, sizeof(request), &response, 3U + (block_count * 4U)))
-		return false;
-
-	/* Check the response over */
-	const uint16_t blocks_read = read_le2(response.count, 0);
-	if (blocks_read == block_count && response.status == DAP_TRANSFER_OK) {
-		for (size_t i = 0; i < block_count; ++i)
+	if (!dap_run_transfer(&request, sizeof(request), &response, 3U + (block_count * 4U), &response_length)) {
+		/* Check if we got any response bytes back and if we got enough, extract the status. */
+		if (response_length < 3U)
+			exit(1);
+		/* Extract the number of blocks of data we got back and copy them out into the block buffer */
+		const uint16_t blocks_read = read_le2(response.count, 0);
+		for (size_t i = 0U; i < blocks_read; ++i)
 			blocks[i] = read_le4(response.data[i], 0);
-		return true;
+		/* We got enough response bytes back for the status to be valid, so put that in the DP's fault member */
+		target_dp->fault = response.status & DAP_TRANSFER_STATUS_MASK;
+		/* If the reason we're here is a WAIT timeout, abort the ongoing transaction to bring the AP back to sanity */
+		if (target_dp->fault == DAP_TRANSFER_WAIT) {
+			DEBUG_ERROR("SWD access resulted in wait, aborting\n");
+			target_dp->abort(target_dp, ADIV5_DP_ABORT_DAPABORT);
+		}
+		return false;
 	}
-	if (response.status != DAP_TRANSFER_OK)
-		target_dp->fault = response.status;
-	else
-		target_dp->fault = 0;
 
-	DEBUG_PROBE("-> transfer failed with %u after processing %u blocks\n", response.status, blocks_read);
-	return false;
+	/* Check the response over, starting by extracting how much data was returned and the response status */
+	const uint16_t blocks_read = read_le2(response.count, 0);
+	const uint8_t result = response.status & DAP_TRANSFER_STATUS_MASK;
+	/* If the request went okay */
+	if (result == DAP_TRANSFER_OK) {
+		/* Extract what data we can to the block buffer */
+		const uint16_t blocks_copy = MIN(blocks_read, block_count);
+		for (size_t i = 0U; i < blocks_copy; ++i)
+			blocks[i] = read_le4(response.data[i], 0);
+	} else {
+		/* If the target didn't like something about what we asked it to do, mark the DP with the status code */
+		target_dp->fault = result & DAP_TRANSFER_STATUS_MASK;
+		DEBUG_PROBE("-> transfer failed with %u after processing %u blocks\n", response.status, blocks_read);
+	}
+	/* Let the caller know if things went okay or not */
+	return result == DAP_TRANSFER_OK;
 }
 
 bool perform_dap_transfer_block_write(
@@ -198,15 +218,16 @@ bool perform_dap_transfer_block_write(
 
 	dap_transfer_block_response_write_s response;
 	/* Run the request having set up the request buffer */
-	if (!dap_run_cmd(&request, DAP_CMD_BLOCK_WRITE_HDR_LEN + (block_count * 4U), &response, sizeof(response)))
+	if (!dap_run_cmd(&request, DAP_CMD_BLOCK_WRITE_HDR_LEN + (size_t)(block_count * 4U), &response, sizeof(response)))
 		return false;
 
 	/* Check the response over */
 	const uint16_t blocks_written = read_le2(response.count, 0);
-	if (blocks_written == block_count && response.status == DAP_TRANSFER_OK)
+	if (blocks_written == block_count && (response.status & DAP_TRANSFER_STATUS_MASK) == DAP_TRANSFER_OK)
 		return true;
-	if (response.status != DAP_TRANSFER_OK)
-		target_dp->fault = response.status;
+	/* If the target didn't like something about what we asked it to do, mark the DP with the status code */
+	if ((response.status & DAP_TRANSFER_STATUS_MASK) != DAP_TRANSFER_OK)
+		target_dp->fault = response.status & DAP_TRANSFER_STATUS_MASK;
 	else
 		target_dp->fault = 0;
 
@@ -214,7 +235,7 @@ bool perform_dap_transfer_block_write(
 	return false;
 }
 
-/* https://www.keil.com/pack/doc/CMSIS/DAP/html/group__DAP__SWJ__Sequence.html */
+/* https://arm-software.github.io/CMSIS-DAP/latest/group__DAP__SWJ__Sequence.html */
 bool perform_dap_swj_sequence(size_t clock_cycles, const uint8_t *data)
 {
 	/* Validate that clock_cycles is in range for the request (spec limits it to 256) */
@@ -365,19 +386,19 @@ static size_t dap_encode_swd_sequence(
 
 bool perform_dap_swd_sequences(dap_swd_sequence_s *const sequences, const uint8_t sequence_count)
 {
-	if (sequence_count > 4)
+	if (sequence_count > 5U)
 		return false;
 
 	DEBUG_PROBE("-> dap_swd_sequence (%u sequences)\n", sequence_count);
-	/* 38 is 2 + (4 * 9) where 9 is the max length of each sequence request */
-	uint8_t request[38] = {
+	/* 47 is 2 + (5 * 9) where 9 is the max length of each sequence request */
+	uint8_t request[47U] = {
 		DAP_SWD_SEQUENCE,
 		sequence_count,
 	};
 	/* Encode the transfers into the buffer */
 	size_t offset = 2U;
 	size_t result_length = 0U;
-	for (uint8_t i = 0; i < sequence_count; ++i) {
+	for (uint8_t i = 0U; i < sequence_count; ++i) {
 		const dap_swd_sequence_s *const sequence = &sequences[i];
 		const size_t adjustment = dap_encode_swd_sequence(sequence, request, offset);
 		/* If encoding failed, return */
@@ -389,11 +410,51 @@ bool perform_dap_swd_sequences(dap_swd_sequence_s *const sequences, const uint8_
 			result_length += (sequence->cycles + 7U) >> 3U;
 	}
 
-	uint8_t response[33] = {DAP_RESPONSE_OK};
+	uint8_t response[41U] = {DAP_RESPONSE_OK};
 	/* Run the request having set up the request buffer */
 	if (!dap_run_cmd(request, offset, response, 1U + result_length)) {
-		DEBUG_PROBE("-> sequence failed with %u\n", response[0]);
+		DEBUG_PROBE("-> sequence failed with %u\n", response[0U]);
 		return false;
+	}
+
+	/* Check if the request was for a DP IDR read, and if it was, check if we got a bugged response */
+	if (!(dap_quirks & DAP_QUIRK_BROKEN_SWD_SEQUENCE) && request[1U] == 0x04U && request[2U] == 0x08U &&
+		request[3U] == 0xa5U && response[0U] == 0x00U && response[1U] == 0x03U && response[2U] == 0xeeU) {
+		dap_quirks |= DAP_QUIRK_BROKEN_SWD_SEQUENCE;
+		DEBUG_WARN("Buggy CMSIS-DAP adaptor found, applying SWD sequence quirk\n");
+	}
+
+	/* If we've got a buggy adaptor, go through the response bytes *backwards* to correct. */
+	if (dap_quirks & DAP_QUIRK_BROKEN_SWD_SEQUENCE) {
+		offset = result_length;
+		uint8_t msb = 0U;
+		for (uint8_t i = 0U; i < sequence_count; ++i) {
+			dap_swd_sequence_s *const sequence = &sequences[sequence_count - (i + 1U)];
+			/* If this one is not an in sequence, skip it */
+			if (sequence->direction == DAP_SWD_OUT_SEQUENCE)
+				continue;
+			/* Figure out how many bytes are in this sequence's response */
+			const size_t bytes = (sequence->cycles + 7U) >> 3U;
+			/* Work through the response data for this chunk of the response */
+			for (size_t byte = 0; byte < bytes; ++byte) {
+				/* Extract the next byte from the end, working backwards */
+				uint8_t value = response[offset - byte];
+				/* Figure out how many bits are used in this response byte */
+				const size_t bits = byte ? 7U : (sequence->cycles & 7U);
+				/* Extract the LSb, shift it away and insert the previous byte's MSb */
+				const uint8_t lsb = value & 1U;
+				value = (msb >> (7U - bits)) | (value >> 1U);
+				msb = lsb << 7U;
+				/* Store the corrected byte back */
+				response[offset - byte] = value;
+			}
+			offset -= bytes;
+		}
+
+		DEBUG_WIRE("  corrected: ");
+		for (size_t idx = 0U; idx < result_length + 1U; ++idx)
+			DEBUG_WIRE("%02x ", response[idx]);
+		DEBUG_WIRE("\n");
 	}
 
 	/* Now we have data, grab the response bytes and stuff them back into the sequence structures */

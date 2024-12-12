@@ -48,12 +48,15 @@ bool riscv64_probe(target_s *target);
 bool efm32_aap_probe(adiv5_access_port_s *ap);
 bool kinetis_mdm_probe(adiv5_access_port_s *ap);
 bool lpc55_dmap_probe(adiv5_access_port_s *ap);
-bool nrf51_mdm_probe(adiv5_access_port_s *ap);
-bool rp_rescue_probe(adiv5_access_port_s *ap);
+bool nrf51_ctrl_ap_probe(adiv5_access_port_s *ap);
+bool nrf54l_ctrl_ap_probe(adiv5_access_port_s *ap);
+bool rp2040_rescue_probe(adiv5_access_port_s *ap);
 
 bool at32f40x_probe(target_s *target); // STM32 clones from Artery
+bool apollo_3_probe(target_s *target);
 bool at32f43x_probe(target_s *target);
 bool ch32f1_probe(target_s *target); // will catch all the clones
+bool ch579_probe(target_s *target);
 bool efm32_probe(target_s *target);
 bool gd32f1_probe(target_s *target);
 bool gd32f4_probe(target_s *target);
@@ -74,11 +77,15 @@ bool mm32l0xx_probe(target_s *target);
 bool mm32f3xx_probe(target_s *target);
 bool msp432e4_probe(target_s *target);
 bool msp432p4_probe(target_s *target);
+bool mspm0_probe(target_s *target);
 bool nrf51_probe(target_s *target);
+bool nrf54l_probe(target_s *target);
 bool nrf91_probe(target_s *target);
+bool puya_probe(target_s *target);
 bool renesas_ra_probe(target_s *target);
 bool renesas_rz_probe(target_s *target);
-bool rp_probe(target_s *target);
+bool rp2040_probe(target_s *target);
+bool rp2350_probe(target_s *target);
 bool s32k3xx_probe(target_s *target);
 bool sam3x_probe(target_s *target);
 bool sam4l_probe(target_s *target);
@@ -95,6 +102,7 @@ bool stm32l1_probe(target_s *target);
 bool stm32l4_probe(target_s *target);
 bool stm32mp15_ca7_probe(target_s *target);
 bool stm32mp15_cm4_probe(target_s *target);
+bool stm32wb0_probe(target_s *target);
 bool zynq7_probe(target_s *target);
 
 void lpc55_dp_prepare(adiv5_debug_port_s *dp);

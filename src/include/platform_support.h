@@ -24,20 +24,22 @@
 #error "Include 'general.h' instead"
 #endif
 
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 #include "stdio_newlib.h"
 #endif
 #include "target.h"
 #include "spi_types.h"
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 void platform_init(int argc, char **argv);
 void platform_pace_poll(void);
+
+#define BMD_CONST_FUNC
 #else
 void platform_init(void);
 
 void platform_pace_poll(void);
-
+#define BMD_CONST_FUNC __attribute__((const))
 #endif
 
 typedef struct platform_timeout platform_timeout_s;
@@ -49,8 +51,13 @@ void platform_delay(uint32_t ms);
 
 extern bool connect_assert_nrst;
 uint32_t platform_target_voltage_sense(void);
+/*
+ * Sample the voltage (Vref aka Vtgt) at which the target is presumably powered,
+ * then format as a string with static storage duration and return a pointer;
+ * or if platform ADC not implemented, then return the fixed string "Unknown".
+ */
 const char *platform_target_voltage(void);
-int platform_hwversion(void);
+int platform_hwversion(void) BMD_CONST_FUNC;
 void platform_nrst_set_val(bool assert);
 bool platform_nrst_get_val(void);
 bool platform_target_get_power(void);
@@ -61,12 +68,16 @@ uint32_t platform_max_frequency_get(void);
 
 void platform_target_clk_output_enable(bool enable);
 
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 bool platform_spi_init(spi_bus_e bus);
 bool platform_spi_deinit(spi_bus_e bus);
 
 bool platform_spi_chip_select(uint8_t device_select);
 uint8_t platform_spi_xfer(spi_bus_e bus, uint8_t value);
+#endif
+
+#ifdef PLATFORM_IDENT_DYNAMIC
+const char *platform_ident(void);
 #endif
 
 #endif /* INCLUDE_PLATFORM_SUPPORT_H */

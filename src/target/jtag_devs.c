@@ -4,6 +4,7 @@
  * Copyright (C) 2011  Black Sphere Technologies Ltd.
  * Written by Gareth McMullin <gareth@blacksphere.co.nz>
  * Copyright (C) 2022  1bitsquared - Rachel Mant <git@dragonmux.network>
+ * Modified by LAK132
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -101,7 +102,7 @@ const jtag_dev_descr_s dev_descr[] = {
 		.descr = "NPX: LPC11C24.",
 	},
 #endif
-#ifdef ENABLE_XILINX
+#ifdef CONFIG_XILINX
 	{
 		.idcode = 0x1396d093U,
 		.idmask = 0xffffffffU,
@@ -331,6 +332,18 @@ const jtag_dev_descr_s dev_descr[] = {
 			},
 	},
 	{
+		.idcode = 0x03636093U,
+		.idmask = 0x0fffffffU,
+#if ENABLE_DEBUG == 1
+		.descr = "Xilinx 6-bit IR.",
+#endif
+		.ir_quirks =
+			{
+				.ir_length = 6U,
+				.ir_value = 0x35U,
+			},
+	},
+	{
 		.idcode = 0x03600093U,
 		.idmask = 0x0fe00fffU,
 #if ENABLE_DEBUG == 1
@@ -391,7 +404,7 @@ const jtag_dev_descr_s dev_descr[] = {
 			},
 	},
 #endif
-#ifdef ENABLE_RISCV
+#ifdef CONFIG_RISCV
 	{
 		.idcode = 0x0000563dU,
 		.idmask = 0x0fffffffU,
@@ -401,7 +414,7 @@ const jtag_dev_descr_s dev_descr[] = {
 		.handler = riscv_jtag_dtm_handler,
 	},
 #endif
-#if defined(ENABLE_CORTEXAR) // && defined(ENABLE_SITARA)
+#if defined(CONFIG_CORTEXAR) // && defined(ENABLE_SITARA)
 	{
 		.idcode = 0x0b90002fU,
 		.idmask = 0x0ff00fffU,

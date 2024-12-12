@@ -34,6 +34,7 @@
 #include "target.h"
 #include "target_internal.h"
 #include "adiv5.h"
+#include "riscv_debug.h"
 #include "timing.h"
 #include "cli.h"
 #include "gdb_if.h"
@@ -68,9 +69,9 @@ static uint32_t max_frequency = 4000000U;
 
 static bmda_cli_options_s cl_opts;
 
-void gdb_ident(char *p, int count)
+void bmda_display_probe(void)
 {
-	snprintf(p, count, "%s (%s), %s", bmda_probe_info.manufacturer, bmda_probe_info.product, bmda_probe_info.version);
+	gdb_outf("Using a %s (%s), %s\n", bmda_probe_info.product, bmda_probe_info.manufacturer, bmda_probe_info.version);
 }
 
 static void exit_function(void)
@@ -114,6 +115,10 @@ void platform_init(int argc, char **argv)
 {
 #if defined(_WIN32) || defined(__CYGWIN__)
 	SetConsoleOutputCP(CP_UTF8);
+	if (setvbuf(stdout, NULL, _IONBF, 0) < 0) {
+		int err = errno;
+		fprintf(stderr, "%s: %s returns %s\n", __func__, "setvbuf()", strerror(err));
+	}
 #endif
 	cl_init(&cl_opts, argc, argv);
 	atexit(exit_function);
@@ -124,7 +129,7 @@ void platform_init(int argc, char **argv)
 		bmda_probe_info.type = PROBE_TYPE_BMP;
 	else if (cl_opts.opt_gpio_map)
 		bmda_probe_info.type = PROBE_TYPE_GPIOD;
-	else if (find_debuggers(&cl_opts, &bmda_probe_info))
+	else if (!find_debuggers(&cl_opts, &bmda_probe_info))
 		exit(1);
 
 	if (cl_opts.opt_list_only)
@@ -145,7 +150,7 @@ void platform_init(int argc, char **argv)
 		break;
 
 	case PROBE_TYPE_CMSIS_DAP:
-		if (!dap_init())
+		if (!dap_init(cl_opts.opt_cmsisdap_allow_fallback))
 			exit(1);
 		break;
 
@@ -309,7 +314,7 @@ void bmda_adiv5_dp_init(adiv5_debug_port_s *const dp)
 	switch (bmda_probe_info.type) {
 	case PROBE_TYPE_BMP:
 		if (cl_opts.opt_no_hl) {
-			DEBUG_WARN("Not using HL commands\n");
+			DEBUG_WARN("Not using ADIv5 acceleration commands\n");
 			break;
 		}
 		remote_adiv5_dp_init(dp);
@@ -330,7 +335,28 @@ void bmda_adiv5_dp_init(adiv5_debug_port_s *const dp)
 	}
 }
 
-void bmda_jtag_dp_init(adiv5_debug_port_s *dp)
+void bmda_adiv6_dp_init(adiv5_debug_port_s *const dp)
+{
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		if (cl_opts.opt_no_hl) {
+			DEBUG_WARN("Not using ADIv6 acceleration commands\n");
+			break;
+		}
+		remote_adiv6_dp_init(dp);
+		break;
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_adiv6_dp_init(dp);
+		break;
+#endif
+
+	default:
+		break;
+	}
+}
+
+void bmda_jtag_dp_init(adiv5_debug_port_s *const dp)
 {
 #if HOSTED_BMP_ONLY == 0
 	switch (bmda_probe_info.type) {
@@ -346,6 +372,22 @@ void bmda_jtag_dp_init(adiv5_debug_port_s *dp)
 #else
 	(void)dp;
 #endif
+}
+
+void bmda_riscv_jtag_dtm_init(riscv_dmi_s *const dmi)
+{
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		if (cl_opts.opt_no_hl) {
+			DEBUG_WARN("Not using RISC-V Debug acceleration commands\n");
+			break;
+		}
+		remote_riscv_jtag_dtm_init(dmi);
+		break;
+
+	default:
+		break;
+	}
 }
 
 char *bmda_adaptor_ident(void)
@@ -395,7 +437,7 @@ const char *platform_target_voltage(void)
 #endif
 
 	default:
-		return NULL;
+		return "Unknown";
 	}
 }
 
@@ -616,203 +658,4 @@ void platform_target_clk_output_enable(const bool enable)
 	default:
 		break;
 	}
-}
-
-static void decode_dp_access(const uint8_t addr, const uint8_t rnw, const uint32_t value)
-{
-	/* How a DP address should be decoded depends on the bank that's presently selected, so make a note of that */
-	static uint8_t dp_bank = 0;
-	const char *reg = NULL;
-
-	/* Try to decode the requested address */
-	switch (addr) {
-	case 0x00U:
-		reg = rnw ? "DPIDR" : "ABORT";
-		break;
-	case 0x04U:
-		switch (dp_bank) {
-		case 0:
-			reg = rnw ? "STATUS" : "CTRL";
-			break;
-		case 1:
-			reg = "DLCR";
-			break;
-		case 2:
-			reg = "TARGETID";
-			break;
-		case 3:
-			reg = "DLPIDR";
-			break;
-		case 4:
-			reg = "EVENTSTAT";
-			break;
-		}
-		break;
-	case 0x08U:
-		if (!rnw)
-			dp_bank = value & 15U;
-		reg = rnw ? "RESEND" : "SELECT";
-		break;
-	case 0x0cU:
-		reg = rnw ? "RDBUFF" : "TARGETSEL";
-		break;
-	}
-
-	if (reg)
-		DEBUG_PROTO("%s: ", reg);
-	else
-		DEBUG_PROTO("Unknown DP register %02x: ", addr);
-}
-
-static void decode_ap_access(const uint8_t ap, const uint8_t addr)
-{
-	DEBUG_PROTO("AP %u ", ap);
-
-	const char *reg = NULL;
-	switch (addr) {
-	case 0x00U:
-		reg = "CSW";
-		break;
-	case 0x04U:
-		reg = "TAR";
-		break;
-	case 0x0cU:
-		reg = "DRW";
-		break;
-	case 0x10U:
-		reg = "DB0";
-		break;
-	case 0x14U:
-		reg = "DB1";
-		break;
-	case 0x18U:
-		reg = "DB2";
-		break;
-	case 0x1cU:
-		reg = "DB3";
-		break;
-	case 0xf8U:
-		reg = "BASE";
-		break;
-	case 0xf4U:
-		reg = "CFG";
-		break;
-	case 0xfcU:
-		reg = "IDR";
-		break;
-	}
-
-	if (reg)
-		DEBUG_PROTO("%s: ", reg);
-	else
-		DEBUG_PROTO("Reserved(%02x): ", addr);
-}
-
-static void decode_access(const uint16_t addr, const uint8_t rnw, const uint8_t apsel, const uint32_t value)
-{
-	if (rnw)
-		DEBUG_PROTO("Read ");
-	else
-		DEBUG_PROTO("Write ");
-
-	if (addr & ADIV5_APnDP)
-		decode_ap_access(apsel, addr & 0xffU);
-	else
-		decode_dp_access(addr & 0xffU, rnw, value);
-}
-
-bool adiv5_write_no_check(adiv5_debug_port_s *dp, uint16_t addr, const uint32_t value)
-{
-	decode_access(addr, ADIV5_LOW_WRITE, 0U, value);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", value);
-	return dp->write_no_check(addr, value);
-}
-
-uint32_t adiv5_read_no_check(adiv5_debug_port_s *dp, uint16_t addr)
-{
-	uint32_t result = dp->read_no_check(addr);
-	decode_access(addr, ADIV5_LOW_READ, 0U, 0U);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", result);
-	return result;
-}
-
-void adiv5_dp_write(adiv5_debug_port_s *dp, uint16_t addr, uint32_t value)
-{
-	decode_access(addr, ADIV5_LOW_WRITE, 0U, value);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", value);
-	dp->low_access(dp, ADIV5_LOW_WRITE, addr, value);
-}
-
-uint32_t adiv5_dp_read(adiv5_debug_port_s *dp, uint16_t addr)
-{
-	uint32_t ret = dp->dp_read(dp, addr);
-	decode_access(addr, ADIV5_LOW_READ, 0U, 0U);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", ret);
-	return ret;
-}
-
-uint32_t adiv5_dp_error(adiv5_debug_port_s *dp)
-{
-	uint32_t ret = dp->error(dp, false);
-	DEBUG_PROTO("DP Error 0x%08" PRIx32 "\n", ret);
-	return ret;
-}
-
-uint32_t adiv5_dp_low_access(adiv5_debug_port_s *dp, uint8_t rnw, uint16_t addr, uint32_t value)
-{
-	uint32_t ret = dp->low_access(dp, rnw, addr, value);
-	decode_access(addr, rnw, 0U, value);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", rnw ? ret : value);
-	return ret;
-}
-
-uint32_t adiv5_ap_read(adiv5_access_port_s *ap, uint16_t addr)
-{
-	uint32_t ret = ap->dp->ap_read(ap, addr);
-	decode_access(addr, ADIV5_LOW_READ, ap->apsel, 0U);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", ret);
-	return ret;
-}
-
-void adiv5_ap_write(adiv5_access_port_s *ap, uint16_t addr, uint32_t value)
-{
-	decode_access(addr, ADIV5_LOW_WRITE, ap->apsel, value);
-	DEBUG_PROTO("0x%08" PRIx32 "\n", value);
-	ap->dp->ap_write(ap, addr, value);
-}
-
-void adiv5_mem_read(adiv5_access_port_s *ap, void *dest, uint32_t src, size_t len)
-{
-	ap->dp->mem_read(ap, dest, src, len);
-	DEBUG_PROTO("ap_memread @ %" PRIx32 " len %zu:", src, len);
-	const uint8_t *const data = (const uint8_t *)dest;
-	for (size_t offset = 0; offset < len; ++offset) {
-		if (offset == 16U)
-			break;
-		DEBUG_PROTO(" %02x", data[offset]);
-	}
-	if (len > 16U)
-		DEBUG_PROTO(" ...");
-	DEBUG_PROTO("\n");
-}
-
-void adiv5_mem_write_sized(adiv5_access_port_s *ap, uint32_t dest, const void *src, size_t len, align_e align)
-{
-	DEBUG_PROTO("ap_mem_write_sized @ %" PRIx32 " len %zu, align %d:", dest, len, 1 << align);
-	const uint8_t *const data = (const uint8_t *)src;
-	for (size_t offset = 0; offset < len; ++offset) {
-		if (offset == 16U)
-			break;
-		DEBUG_PROTO(" %02x", data[offset]);
-	}
-	if (len > 16U)
-		DEBUG_PROTO(" ...");
-	DEBUG_PROTO("\n");
-	ap->dp->mem_write(ap, dest, src, len, align);
-}
-
-void adiv5_dp_abort(adiv5_debug_port_s *dp, uint32_t abort)
-{
-	DEBUG_PROTO("Abort: %08" PRIx32 "\n", abort);
-	dp->abort(dp, abort);
 }

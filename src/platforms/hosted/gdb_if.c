@@ -35,8 +35,12 @@
 typedef SOCKET socket_t;
 #define PRI_SOCKET "zu"
 #ifndef __CYGWIN__
+#ifdef _WIN64
 typedef signed long long ssize_t;
-#endif
+#else
+typedef signed int ssize_t;
+#endif /* _WIN64 */
+#endif /* __CYGWIN__ */
 #else
 #include <sys/socket.h>
 #include <netdb.h>
@@ -258,7 +262,7 @@ int gdb_if_init(void)
 				DEBUG_WARN("Listening on IPv6 only.\n");
 		}
 
-		if (bind(gdb_if_serv, (sockaddr_s *)&addr, family_to_size(addr.ss_family)) == -1) {
+		if (bind(gdb_if_serv, (const sockaddr_s *)&addr, family_to_size(addr.ss_family)) == -1) {
 			handle_error(gdb_if_serv, "binding socket");
 			continue;
 		}

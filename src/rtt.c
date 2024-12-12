@@ -45,7 +45,7 @@ rtt_channel_s rtt_channel[MAX_RTT_CHAN];
 uint32_t rtt_min_poll_ms = 8;   /* 8 ms */
 uint32_t rtt_max_poll_ms = 256; /* 0.256 s */
 uint32_t rtt_max_poll_errs = 10;
-static uint32_t poll_ms;
+uint32_t rtt_poll_ms;
 static uint32_t poll_errs;
 static uint32_t last_poll_ms;
 /* flags for data from host to target */
@@ -81,30 +81,70 @@ static char xmit_buf[RTT_UP_BUF_SIZE];
 **********************************************************************
 */
 
+/*
+ * Search in memory for a hash of the target string. This uses a rolling
+ * hash as described in [0] where memory is appended to a hash byte-by
+ * byte, enabling fast searching for a target string in memory without
+ * needing to continuously backtrack.
+ *
+ * The magic string we're looking for is 16 bytes long, which is stored
+ * as `m`. Data is read into `srch_buf` in chunks of `stride` bytes, and
+ * the previous `m` bytes are kept in memory to calculate the full hash.
+ *
+ * On each loop, the previous `stride + m` bytes are hashed together with
+ * prime `p`. If the string is found the hashes will match. Note that
+ * this does not check that the actual string matches, so it is prone
+ * to false positives.
+ *
+ * The patten was derived using the following function:
+ *
+ * uint64_t make_hash(const char *s, size_t hash_len, uint64_t q)
+ * {
+ *     // Horner’s method, applied to modular hashing
+ *     uint64_t h = 0;
+ *     for (int j = 0; j < hash_len; j++)
+ *         h = (256 * h + s[j]) % q;
+ *     return h;
+ * };
+ *
+ * The `remainder` was precomputed using the following function:
+ *
+ * uint64_t make_remainder(size_t hash_len, uint64_t q) {
+ *     // precompute 256^(m-1) % q for use in removing leading digit
+ *     uint64_t r = 1;
+ *     for (int i = 1; i <= hash_len-1; i++)
+ *         r = (256 * r) % q;
+ *     return r;
+ * }
+ *
+ * References:
+ * [Algo] Rolling hash; Rabin-Karp string search
+ * - 0: https://yurichev.com/news/20210205_rolling_hash/
+ */
 static uint32_t fast_search(target_s *const cur_target, const uint32_t ram_start, const uint32_t ram_end)
 {
-	static const uint32_t m = 16;
-	static const uint64_t p = 0x444110cd;
+	static const uint32_t hash_len = 16;
+	static const uint64_t pattern = 0x444110cd;
+	static const uint64_t remainder = 0x73b07d01;
 	static const uint64_t q = 0x797a9691; /* prime */
-	static const uint64_t r = 0x73b07d01;
 	static const uint32_t stride = 128;
-	uint64_t t = 0;
-	uint8_t *srch_buf = alloca(m + stride);
+	uint64_t hash = 0;
+	uint8_t *srch_buf = alloca(hash_len + stride);
 
-	memset(srch_buf, 0, m + stride);
+	memset(srch_buf, 0, hash_len + stride);
 
 	for (uint32_t addr = ram_start; addr < ram_end; addr += stride) {
 		uint32_t buf_siz = MIN(stride, ram_end - addr);
-		memcpy(srch_buf, srch_buf + stride, m);
-		if (target_mem_read(cur_target, srch_buf + m, addr, buf_siz)) {
+		memcpy(srch_buf, srch_buf + stride, hash_len);
+		if (target_mem32_read(cur_target, srch_buf + hash_len, addr, buf_siz)) {
 			gdb_outf("rtt: read fail at 0x%" PRIx32 "\r\n", addr);
 			return 0;
 		}
 		for (uint32_t i = 0; i < buf_siz; i++) {
-			t = (t + q - r * srch_buf[i] % q) % q;
-			t = ((t << 8U) + srch_buf[i + m]) % q;
-			if (p == t)
-				return addr + i - m + 1U;
+			hash = (hash + q - remainder * srch_buf[i] % q) % q;
+			hash = ((hash << 8U) + srch_buf[i + hash_len]) % q;
+			if (pattern == hash)
+				return addr + i - hash_len + 1U;
 		}
 	}
 	/* no match */
@@ -122,7 +162,7 @@ static uint32_t memory_search(target_s *const cur_target, const uint32_t ram_sta
 
 	for (uint32_t addr = ram_start; addr < ram_end; addr += sizeof(srch_buf) - srch_str_len - 1U) {
 		uint32_t buf_siz = MIN(ram_end - addr, sizeof(srch_buf));
-		if (target_mem_read(cur_target, srch_buf, addr, buf_siz)) {
+		if (target_mem32_read(cur_target, srch_buf, addr, buf_siz)) {
 			gdb_outf("rtt: read fail at 0x%" PRIx32 "\r\n", addr);
 			continue;
 		}
@@ -137,7 +177,7 @@ static uint32_t memory_search(target_s *const cur_target, const uint32_t ram_sta
 static void find_rtt(target_s *const cur_target)
 {
 	rtt_found = false;
-	poll_ms = rtt_max_poll_ms;
+	rtt_poll_ms = rtt_max_poll_ms;
 	poll_errs = 0;
 	last_poll_ms = 0;
 
@@ -164,12 +204,12 @@ static void find_rtt(target_s *const cur_target)
 		else
 			rtt_cbaddr = memory_search(cur_target, rtt_ram_start, rtt_ram_end);
 	}
-	DEBUG_INFO("rtt: match at 0x%" PRIx32 "\r\n", rtt_cbaddr);
 
 	if (rtt_cbaddr) {
+		DEBUG_INFO("rtt: match at 0x%" PRIx32 "\n", rtt_cbaddr);
 		/* read number of rtt up and down channels from target */
 		uint32_t num_buf[2];
-		if (target_mem_read(cur_target, num_buf, rtt_cbaddr + 16U, sizeof(num_buf)))
+		if (target_mem32_read(cur_target, num_buf, rtt_cbaddr + 16U, sizeof(num_buf)))
 			return;
 		rtt_num_up_chan = num_buf[0];
 		if (rtt_num_up_chan > MAX_RTT_CHAN)
@@ -180,12 +220,12 @@ static void find_rtt(target_s *const cur_target)
 
 		/* sanity checks */
 		if (rtt_num_up_chan > 255U || rtt_num_down_chan > 255U) {
-			gdb_out("rtt: bad cblock\r\n");
+			gdb_out("rtt: bad cblock\n");
 			rtt_enabled = false;
 			return;
 		}
 		if (rtt_num_up_chan == 0 && rtt_num_down_chan == 0) {
-			gdb_out("rtt: empty cblock\r\n");
+			gdb_out("rtt: empty cblock\n");
 			rtt_enabled = false;
 			return;
 		}
@@ -204,7 +244,7 @@ static void find_rtt(target_s *const cur_target)
 		}
 
 		/* save first 24 bytes of control block */
-		if (target_mem_read(cur_target, saved_cblock_header, rtt_cbaddr, sizeof(saved_cblock_header)))
+		if (target_mem32_read(cur_target, saved_cblock_header, rtt_cbaddr, sizeof(saved_cblock_header)))
 			return;
 
 		rtt_found = true;
@@ -222,8 +262,15 @@ static void find_rtt(target_s *const cur_target)
 /* poll if host has new data for target */
 static rtt_retval_e read_rtt(target_s *const cur_target, const uint32_t i)
 {
+	/*
+	 * Down buffers are located in the rtt_channel array after the
+	 * up buffers. Subtract the index from the total number of up
+	 * buffers to get the down buffer number.
+	 */
+	uint32_t channel = i - rtt_num_up_chan;
+
 	/* copy data from recv_buf to target rtt 'down' buffer */
-	if (rtt_nodata())
+	if (rtt_nodata(channel))
 		return RTT_IDLE;
 
 	if (cur_target == NULL || rtt_channel[i].buf_addr == 0 || rtt_channel[i].buf_size == 0)
@@ -237,10 +284,10 @@ static rtt_retval_e read_rtt(target_s *const cur_target, const uint32_t i)
 		const uint32_t next_head = (rtt_channel[i].head + 1U) % rtt_channel[i].buf_size;
 		if (rtt_channel[i].tail == next_head)
 			break;
-		const int ch = rtt_getchar();
+		const int ch = rtt_getchar(channel);
 		if (ch == -1)
 			break;
-		if (target_mem_write(cur_target, rtt_channel[i].buf_addr + rtt_channel[i].head, &ch, 1))
+		if (target_mem32_write(cur_target, rtt_channel[i].buf_addr + rtt_channel[i].head, &ch, 1))
 			return RTT_ERR;
 		/* advance head pointer */
 		rtt_channel[i].head = next_head;
@@ -248,7 +295,7 @@ static rtt_retval_e read_rtt(target_s *const cur_target, const uint32_t i)
 
 	/* update head of target 'down' buffer */
 	const uint32_t head_addr = rtt_cbaddr + 24U + i * 24U + 12U;
-	if (target_mem_write(cur_target, head_addr, &rtt_channel[i].head, sizeof(rtt_channel[i].head)))
+	if (target_mem32_write(cur_target, head_addr, &rtt_channel[i].head, sizeof(rtt_channel[i].head)))
 		return RTT_ERR;
 	return RTT_OK;
 }
@@ -260,7 +307,7 @@ static rtt_retval_e read_rtt(target_s *const cur_target, const uint32_t i)
 **********************************************************************
 */
 
-/* rtt_aligned_mem_read(): same as target_mem_read, but word aligned for speed.
+/* rtt_aligned_mem_read(): same as target_mem32_read, but word aligned for speed.
    note: dest has to be len + 8 bytes, to allow for alignment and padding.
  */
 uint32_t rtt_aligned_mem_read(target_s *t, void *dest, target_addr_t src, size_t len)
@@ -272,9 +319,9 @@ uint32_t rtt_aligned_mem_read(target_s *t, void *dest, target_addr_t src, size_t
 		len0 = (len0 + 4U) & ~0x3U;
 
 	if (src0 == src && len0 == len)
-		return target_mem_read(t, dest, src, len);
+		return target_mem32_read(t, dest, src, len);
 
-	const uint32_t retval = target_mem_read(t, dest, src0, len0);
+	const uint32_t retval = target_mem32_read(t, dest, src0, len0);
 	memmove(dest, (uint8_t *)dest + offset, len);
 	return retval;
 }
@@ -316,11 +363,11 @@ static rtt_retval_e print_rtt(target_s *const cur_target, const uint32_t i)
 
 	/* update tail of target 'up' buffer */
 	const uint32_t tail_addr = rtt_cbaddr + 24U + i * 24U + 16U;
-	if (target_mem_write(cur_target, tail_addr, &rtt_channel[i].tail, sizeof(rtt_channel[i].tail)))
+	if (target_mem32_write(cur_target, tail_addr, &rtt_channel[i].tail, sizeof(rtt_channel[i].tail)))
 		return RTT_ERR;
 
 	/* write buffer to usb */
-	rtt_write(xmit_buf, bytes_read);
+	rtt_write(i, xmit_buf, bytes_read);
 
 	return RTT_OK;
 }
@@ -341,7 +388,7 @@ void poll_rtt(target_s *const cur_target)
 	/* target present and rtt enabled */
 	uint32_t now = platform_time_ms();
 
-	if (last_poll_ms + poll_ms <= now || now < last_poll_ms) {
+	if (last_poll_ms + rtt_poll_ms <= now || now < last_poll_ms) {
 		if (!rtt_found)
 			/* check if target needs to be halted during memory access */
 			rtt_halt = target_mem_access_needs_halt(cur_target);
@@ -366,7 +413,7 @@ void poll_rtt(target_s *const cur_target)
 		if (rtt_found) {
 			uint32_t cblock_header[6]; // first 24 bytes of control block
 			/* check control block not changed or corrupted */
-			if (target_mem_read(cur_target, cblock_header, rtt_cbaddr, sizeof(cblock_header)) ||
+			if (target_mem32_read(cur_target, cblock_header, rtt_cbaddr, sizeof(cblock_header)) ||
 				memcmp(saved_cblock_header, cblock_header, sizeof(cblock_header)) != 0)
 				rtt_found = false; // force searching control block next poll_rtt()
 		}
@@ -377,7 +424,7 @@ void poll_rtt(target_s *const cur_target)
 		if (rtt_found && rtt_cbaddr) {
 			/* copy control block from target */
 			uint32_t rtt_cblock_size = sizeof(rtt_channel[0]) * (rtt_num_up_chan + rtt_num_down_chan);
-			if (target_mem_read(cur_target, rtt_channel, rtt_cbaddr + 24U, rtt_cblock_size)) {
+			if (target_mem32_read(cur_target, rtt_channel, rtt_cbaddr + 24U, rtt_cblock_size)) {
 				gdb_outf("rtt: read fail at 0x%" PRIx32 "\r\n", rtt_cbaddr + 24U);
 				rtt_err = true;
 			} else {
@@ -410,14 +457,14 @@ void poll_rtt(target_s *const cur_target)
 
 		/* rtt polling frequency goes up and down with rtt activity */
 		if (rtt_busy && !rtt_err)
-			poll_ms /= 2U;
+			rtt_poll_ms /= 2U;
 		else
-			poll_ms *= 2U;
+			rtt_poll_ms *= 2U;
 
-		if (poll_ms > rtt_max_poll_ms)
-			poll_ms = rtt_max_poll_ms;
-		else if (poll_ms < rtt_min_poll_ms)
-			poll_ms = rtt_min_poll_ms;
+		if (rtt_poll_ms > rtt_max_poll_ms)
+			rtt_poll_ms = rtt_max_poll_ms;
+		else if (rtt_poll_ms < rtt_min_poll_ms)
+			rtt_poll_ms = rtt_min_poll_ms;
 
 		if (rtt_err) {
 			gdb_out("rtt: err\r\n");

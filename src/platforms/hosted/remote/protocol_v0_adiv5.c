@@ -63,9 +63,11 @@ uint32_t remote_v0_adiv5_raw_access(
 	adiv5_debug_port_s *const dp, const uint8_t rnw, const uint16_t addr, const uint32_t request_value)
 {
 	(void)dp;
+	/* Remap the access from our current format to the remote v0 register address format */
+	const uint16_t ap_reg = (addr & ADIV5_APnDP ? REMOTE_ADIV5_APnDP : 0U) | (addr & 0x00ffU);
 	char buffer[REMOTE_MAX_MSG_SIZE];
 	/* Create the request and send it to the remote */
-	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIv5_RAW_ACCESS_STR, rnw, addr, request_value);
+	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_RAW_ACCESS_STR, rnw, ap_reg, request_value);
 	platform_buffer_write(buffer, length);
 	/* Read back the answer and check for errors */
 	length = platform_buffer_read(buffer, REMOTE_MAX_MSG_SIZE);
@@ -74,7 +76,7 @@ uint32_t remote_v0_adiv5_raw_access(
 	/* If the response indicates all's OK, decode the data read and return it */
 	uint32_t result_value = 0U;
 	unhexify(&result_value, buffer + 1, 4);
-	DEBUG_PROBE("%s: addr %04x %s %08" PRIx32, __func__, addr, rnw ? "->" : "<-", rnw ? result_value : request_value);
+	DEBUG_PROBE("%s: addr %04x %s %08" PRIx32, __func__, ap_reg, rnw ? "->" : "<-", rnw ? result_value : request_value);
 	if (!rnw)
 		DEBUG_PROBE(" -> %08" PRIx32, result_value);
 	DEBUG_PROBE("\n");
@@ -84,9 +86,11 @@ uint32_t remote_v0_adiv5_raw_access(
 uint32_t remote_v0_adiv5_dp_read(adiv5_debug_port_s *const dp, const uint16_t addr)
 {
 	(void)dp;
+	/* Remap the access from our current format to the remote v0 register address format */
+	const uint16_t ap_reg = (addr & ADIV5_APnDP ? REMOTE_ADIV5_APnDP : 0U) | (addr & 0x00ffU);
 	char buffer[REMOTE_MAX_MSG_SIZE];
 	/* Create the request and send it to the remote */
-	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_DP_READ_STR, addr);
+	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_DP_READ_STR, ap_reg);
 	platform_buffer_write(buffer, length);
 	/* Read back the answer and check for errors */
 	length = platform_buffer_read(buffer, REMOTE_MAX_MSG_SIZE);
@@ -95,15 +99,17 @@ uint32_t remote_v0_adiv5_dp_read(adiv5_debug_port_s *const dp, const uint16_t ad
 	/* If the response indicates all's OK, decode the data read and return it */
 	uint32_t value = 0U;
 	unhexify(&value, buffer + 1, 4);
-	DEBUG_PROBE("%s: addr %04x -> %08" PRIx32 "\n", __func__, addr, value);
+	DEBUG_PROBE("%s: addr %04x -> %08" PRIx32 "\n", __func__, ap_reg, value);
 	return value;
 }
 
 uint32_t remote_v0_adiv5_ap_read(adiv5_access_port_s *const ap, const uint16_t addr)
 {
+	/* Remap the access from our current format to the remote v0 register address format */
+	const uint16_t ap_reg = (addr & ADIV5_APnDP ? REMOTE_ADIV5_APnDP : 0U) | (addr & 0x00ffU);
 	char buffer[REMOTE_MAX_MSG_SIZE];
 	/* Create the request and send it to the remote */
-	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_AP_READ_STR, ap->apsel, addr);
+	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_AP_READ_STR, ap->apsel, ap_reg);
 	platform_buffer_write(buffer, length);
 	/* Read back the answer and check for errors */
 	length = platform_buffer_read(buffer, REMOTE_MAX_MSG_SIZE);
@@ -112,31 +118,38 @@ uint32_t remote_v0_adiv5_ap_read(adiv5_access_port_s *const ap, const uint16_t a
 	/* If the response indicates all's OK, decode the data read and return it */
 	uint32_t value = 0U;
 	unhexify(&value, buffer + 1, 4);
-	DEBUG_PROBE("%s: addr %04x -> %08" PRIx32 "\n", __func__, addr, value);
+	DEBUG_PROBE("%s: addr %04x -> %08" PRIx32 "\n", __func__, ap_reg, value);
 	return value;
 }
 
 void remote_v0_adiv5_ap_write(adiv5_access_port_s *const ap, const uint16_t addr, const uint32_t value)
 {
+	/* Remap the access from our current format to the remote v0 register address format */
+	const uint16_t ap_reg = (addr & ADIV5_APnDP ? REMOTE_ADIV5_APnDP : 0U) | (addr & 0x00ffU);
 	char buffer[REMOTE_MAX_MSG_SIZE];
 	/* Create the request and send it to the remote */
-	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_AP_WRITE_STR, ap->apsel, addr, value);
+	ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_AP_WRITE_STR, ap->apsel, ap_reg, value);
 	platform_buffer_write(buffer, length);
 	/* Read back the answer and check for errors */
 	length = platform_buffer_read(buffer, REMOTE_MAX_MSG_SIZE);
 	if (!remote_adiv5_check_error(__func__, buffer, length))
 		return;
-	DEBUG_PROBE("%s: addr %04x <- %08" PRIx32 "\n", __func__, addr, value);
+	DEBUG_PROBE("%s: addr %04x <- %08" PRIx32 "\n", __func__, ap_reg, value);
 }
 
 void remote_v0_adiv5_mem_read_bytes(
-	adiv5_access_port_s *const ap, void *const dest, const uint32_t src, const size_t read_length)
+	adiv5_access_port_s *const ap, void *const dest, const target_addr64_t src, const size_t read_length)
 {
+	/* Check if this is supposed to be a 64-bit access and bail gracefully if it is */
+	if (ap->flags & ADIV5_AP_FLAGS_64BIT) {
+		DEBUG_ERROR("%s unable to do 64-bit memory access\n", __func__);
+		return;
+	}
 	/* Check if we have anything to do */
 	if (!read_length)
 		return;
 	char *const data = (char *)dest;
-	DEBUG_PROBE("%s: @%08" PRIx32 "+%zx\n", __func__, src, read_length);
+	DEBUG_PROBE("%s: @%08" PRIx64 "+%zx\n", __func__, src, read_length);
 	char buffer[REMOTE_MAX_MSG_SIZE];
 	/*
 	 * As we do, calculate how large a transfer we can do to the firmware.
@@ -148,8 +161,8 @@ void remote_v0_adiv5_mem_read_bytes(
 		/* Pick the amount left to read or the block size, whichever is smaller */
 		const size_t amount = MIN(read_length - offset, blocksize);
 		/* Create the request and send it to the remote */
-		ssize_t length =
-			snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIv5_MEM_READ_STR, ap->apsel, ap->csw, src + offset, amount);
+		ssize_t length = snprintf(
+			buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_MEM_READ_STR, ap->apsel, ap->csw, (uint32_t)src + offset, amount);
 		platform_buffer_write(buffer, length);
 
 		/* Read back the answer and check for errors */
@@ -163,27 +176,32 @@ void remote_v0_adiv5_mem_read_bytes(
 	}
 }
 
-void remote_v0_adiv5_mem_write_bytes(adiv5_access_port_s *const ap, const uint32_t dest, const void *const src,
+void remote_v0_adiv5_mem_write_bytes(adiv5_access_port_s *const ap, const target_addr64_t dest, const void *const src,
 	const size_t write_length, const align_e align)
 {
+	/* Check if this is supposed to be a 64-bit access and bail gracefully if it is */
+	if (ap->flags & ADIV5_AP_FLAGS_64BIT) {
+		DEBUG_ERROR("%s unable to do 64-bit memory access\n", __func__);
+		return;
+	}
 	/* Check if we have anything to do */
 	if (!write_length)
 		return;
 	const char *data = (const char *)src;
-	DEBUG_PROBE("%s: @%08" PRIx32 "+%zx alignment %u\n", __func__, dest, write_length, align);
+	DEBUG_PROBE("%s: @%08" PRIx64 "+%zx alignment %u\n", __func__, dest, write_length, align);
 	/* + 1 for terminating NUL character */
 	char buffer[REMOTE_MAX_MSG_SIZE + 1U];
 	/* As we do, calculate how large a transfer we can do to the firmware */
 	const size_t alignment_mask = ~((1U << align) - 1U);
-	const size_t blocksize = ((REMOTE_MAX_MSG_SIZE - REMOTE_ADIv5_MEM_WRITE_LENGTH) / 2U) & alignment_mask;
+	const size_t blocksize = ((REMOTE_MAX_MSG_SIZE - REMOTE_ADIV5_MEM_WRITE_LENGTH) / 2U) & alignment_mask;
 	/* For each transfer block size, ask the firmware to write that block of bytes */
 	for (size_t offset = 0; offset < write_length; offset += blocksize) {
 		/* Pick the amount left to write or the block size, whichever is smaller */
 		const size_t amount = MIN(write_length - offset, blocksize);
 		/* Create the request and validate it ends up the right length */
-		ssize_t length = snprintf(
-			buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIv5_MEM_WRITE_STR, ap->apsel, ap->csw, align, dest + offset, amount);
-		assert(length == REMOTE_ADIv5_MEM_WRITE_LENGTH - 1U);
+		ssize_t length = snprintf(buffer, REMOTE_MAX_MSG_SIZE, REMOTE_ADIV5_MEM_WRITE_STR, ap->apsel, ap->csw, align,
+			(uint32_t)dest + offset, amount);
+		assert(length == REMOTE_ADIV5_MEM_WRITE_LENGTH - 1U);
 		/* Encode the data to send after the request block and append the packet termination marker */
 		hexify(buffer + length, data + offset, amount);
 		length += (ssize_t)(amount * 2U);

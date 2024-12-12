@@ -31,17 +31,20 @@
 platform_stm32_includes = include_directories('.')
 
 platform_stm32_sources = files(
-	'gdb_if.c',
 	'serialno.c',
 	'timing_stm32.c',
-	'traceswodecode.c',
 )
 
-# TODO: add proper traceswoasync support
-# This is a temporary hack to allow selecting traceswoasync vs traceswo implementation
-fixme_platform_stm32_traceswo = declare_dependency(sources: files('traceswo.c'))
-fixme_platform_stm32_traceswoasync = declare_dependency(sources: files('traceswoasync.c'))
-fixme_platform_stm32f7_traceswoasync = declare_dependency(sources: files('traceswoasync_f723.c'))
+if probe != 'ctxlink'
+	platform_stm32_sources += files('gdb_if.c')
+endif
+
+platform_stm32_swo = declare_dependency(sources: files(
+	'swo.c',
+	'swo_itm_decode.c',
+))
+platform_stm32_swo_manchester = declare_dependency(sources: files('swo_manchester.c'))
+platform_stm32_swo_uart = declare_dependency(sources: files('swo_uart.c'))
 
 # RTT support handling
 if get_option('rtt_support')
@@ -56,7 +59,7 @@ platform_stm32_dfu_sources = files(
 platform_stm32_args = [
 	'-mthumb',
 	'-nostartfiles',
-	'-DPC_HOSTED=0',
+	'-DCONFIG_BMDA=0',
 ]
 
 platform_stm32_link_args = [
@@ -64,7 +67,7 @@ platform_stm32_link_args = [
 	'-lc',
 	'-nostartfiles',
 	'--specs=nano.specs',
-	get_option('debug_output') ? '--specs=rdimon.specs' : '--specs=nosys.specs',
+	'--specs=nosys.specs',
 	'-Wl,-gc-sections',
 ]
 

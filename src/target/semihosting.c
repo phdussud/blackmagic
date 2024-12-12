@@ -2,7 +2,7 @@
  * This file is part of the Black Magic Debug project.
  *
  * Copyright (C) 2012-2020 Black Sphere Technologies Ltd.
- * Copyright (C) 2022-2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2022-2024 1BitSquared <info@1bitsquared.com>
  * Written by Rachel Mant <git@dragonmux.network>
  * Contains source and ideas from Gareth McMullin <gareth@blacksphere.co.nz>
  *
@@ -45,6 +45,7 @@
 #include "target_internal.h"
 #include "gdb_main.h"
 #include "gdb_packet.h"
+#include "hex_utils.h"
 #include "semihosting.h"
 #include "semihosting_internal.h"
 #include "buffer_utils.h"
@@ -54,7 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 #include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -122,14 +123,12 @@ const char *const semihosting_names[] = {
 };
 #endif
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 static semihosting_errno_e semihosting_errno(void);
 #endif
 
-int semihosting_reply(target_controller_s *const tc, char *const pbuf, const int len)
+int32_t semihosting_reply(target_controller_s *const tc, char *const pbuf)
 {
-	(void)len;
-
 	/*
 	 * File-I/O Remote Protocol Extension
 	 * See https://sourceware.org/gdb/onlinedocs/gdb/Protocol-Basics.html#Protocol-Basics
@@ -146,16 +145,14 @@ int semihosting_reply(target_controller_s *const tc, char *const pbuf, const int
 	 * 		The Ctrl-C flag itself consists of the character ‘C’:
 	 */
 
-	const bool retcode_is_negative = pbuf[1U] == '-';
+	uint32_t retcode = 0;
+	uint32_t gdb_errno = 0;
+	const char *rest = NULL;
 
-	unsigned int retcode = 0;
-	unsigned int gdb_errno = 0;
-	char ctrl_c_flag = '\0';
-	const int items = sscanf(pbuf + (retcode_is_negative ? 2U : 1U), "%x,%x,%c", &retcode, &gdb_errno, &ctrl_c_flag);
-
-	if (items < 1) {
+	/* This function will handle '-' preceding the return code and correctly negate the result. */
+	if (!read_hex32(pbuf, &rest, &retcode, READ_HEX_NO_FOLLOW)) {
 		/*
-		 * Something went wrong with the sscanf or the packet format, avoid UB
+		 * There is no retcode in the packet, so what do?
 		 * FIXME: how do we properly handle this?
 		 */
 		tc->interrupted = false;
@@ -163,13 +160,17 @@ int semihosting_reply(target_controller_s *const tc, char *const pbuf, const int
 		return -1;
 	}
 
+	tc->gdb_errno = TARGET_SUCCESS;
+
 	/* If the call was successful the errno may be omitted */
-	tc->gdb_errno = items >= 2 ? gdb_errno : TARGET_SUCCESS;
+	if (rest[0] == ',' && read_hex32(rest + 1, &rest, &gdb_errno, READ_HEX_NO_FOLLOW)) {
+		tc->gdb_errno = gdb_errno;
+		/* If break is requested */
+		if (rest[0] == ',')
+			tc->interrupted = rest[1] == 'C';
+	}
 
-	/* If break is requested */
-	tc->interrupted = items == 3 && ctrl_c_flag == 'C';
-
-	return retcode_is_negative ? -retcode : retcode;
+	return retcode;
 }
 
 static int32_t semihosting_get_gdb_response(target_controller_s *const tc)
@@ -182,9 +183,13 @@ static int32_t semihosting_get_gdb_response(target_controller_s *const tc)
 		/* If this was an escape packet (or gdb_if reports link closed), fail the call */
 		if (size == 1U && packet_buffer[0] == '\x04')
 			return -1;
+		/*
+		 * If this was an F-packet, we are done waiting.
+		 * Check before gdb_main_loop as it may clobber the packet buffer.
+		 */
+		const bool done = packet_buffer[0] == 'F';
 		const int32_t result = gdb_main_loop(tc, packet_buffer, GDB_PACKET_BUFFER_SIZE, size, true);
-		/* If this was an F-packet, we're done */
-		if (packet_buffer[0] == 'F')
+		if (done)
 			return result;
 	}
 }
@@ -193,14 +198,14 @@ static int32_t semihosting_get_gdb_response(target_controller_s *const tc)
 static int32_t semihosting_remote_read(
 	target_s *const target, const int32_t fd, const target_addr_t buf_taddr, const uint32_t count)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if ((target->stdout_redirected && fd == STDIN_FILENO) || fd > STDERR_FILENO) {
 		uint8_t *const buf = malloc(count);
 		if (buf == NULL)
 			return -1;
 		const ssize_t result = read(fd, buf, count);
 		target->tc->gdb_errno = semihosting_errno();
-		target_mem_write(target, buf_taddr, buf, count);
+		target_mem32_write(target, buf_taddr, buf, count);
 		free(buf);
 		if (target_check_error(target))
 			return -1;
@@ -215,12 +220,12 @@ static int32_t semihosting_remote_read(
 static int32_t semihosting_remote_write(
 	target_s *const target, const int32_t fd, const target_addr_t buf_taddr, const uint32_t count)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (fd > STDERR_FILENO) {
 		uint8_t *const buf = malloc(count);
 		if (buf == NULL)
 			return -1;
-		target_mem_read(target, buf, buf_taddr, count);
+		target_mem32_read(target, buf, buf_taddr, count);
 		if (target_check_error(target)) {
 			free(buf);
 			return -1;
@@ -236,8 +241,8 @@ static int32_t semihosting_remote_write(
 		uint8_t buffer[STDOUT_READ_BUF_SIZE];
 		for (size_t offset = 0; offset < count; offset += STDOUT_READ_BUF_SIZE) {
 			const size_t amount = MIN(count - offset, STDOUT_READ_BUF_SIZE);
-			target_mem_read(target, buffer, buf_taddr, amount);
-#if PC_HOSTED == 0
+			target_mem32_read(target, buffer, buf_taddr, amount);
+#if CONFIG_BMDA == 0
 			debug_serial_send_stdout(buffer, amount);
 #else
 			const ssize_t result = write(fd, buffer, amount);
@@ -254,7 +259,7 @@ static int32_t semihosting_remote_write(
 	return semihosting_get_gdb_response(target->tc);
 }
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 /*
  * Convert an errno value from a syscall into its GDB-compat target errno equivalent
  *
@@ -319,7 +324,7 @@ const char *semihosting_read_string(
 	char *string = malloc(string_length + 1U);
 	if (string == NULL)
 		return NULL;
-	target_mem_read(target, string, string_taddr, string_length + 1U);
+	target_mem32_read(target, string, string_taddr, string_length + 1U);
 	if (target_check_error(target)) {
 		free(string);
 		return NULL;
@@ -350,7 +355,7 @@ int32_t semihosting_open(target_s *const target, const semihosting_s *const requ
 
 	if (file_name_length <= 4U) {
 		char file_name[4U];
-		target_mem_read(target, file_name, file_name_taddr, file_name_length + 1U);
+		target_mem32_read(target, file_name, file_name_taddr, file_name_length + 1U);
 
 		/* Handle requests for console I/O */
 		if (!strncmp(file_name, ":tt", 4U)) {
@@ -365,7 +370,7 @@ int32_t semihosting_open(target_s *const target, const semihosting_s *const requ
 		}
 	} else if (file_name_length <= 22U) {
 		char file_name[22U];
-		target_mem_read(target, file_name, file_name_taddr, file_name_length + 1U);
+		target_mem32_read(target, file_name, file_name_taddr, file_name_length + 1U);
 
 		/* Handle a request for the features "file" */
 		if (!strncmp(file_name, ":semihosting-features", 22U)) {
@@ -378,7 +383,7 @@ int32_t semihosting_open(target_s *const target, const semihosting_s *const requ
 		}
 	}
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	const char *const file_name = semihosting_read_string(target, file_name_taddr, file_name_length);
 	if (file_name == NULL)
 		return -1;
@@ -398,7 +403,10 @@ int32_t semihosting_open(target_s *const target, const semihosting_s *const requ
 
 	const int32_t result = open(file_name, native_open_mode | O_NOCTTY, 0644);
 	target->tc->gdb_errno = semihosting_errno();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
 	free((void *)file_name);
+#pragma GCC diagnostic pop
 #else
 	gdb_putpacket_f("Fopen,%08" PRIX32 "/%08" PRIX32 ",%08" PRIX32 ",%08X", file_name_taddr, file_name_length + 1U,
 		open_mode, 0644U);
@@ -419,7 +427,7 @@ int32_t semihosting_close(target_s *const target, const semihosting_s *const req
 	if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO || request->params[0] == INT32_MAX)
 		return 0;
 		/* Otherwise close the descriptor returned by semihosting_open() */
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	const int32_t result = close(fd);
 	target->tc->gdb_errno = semihosting_errno();
 	return result;
@@ -433,7 +441,7 @@ int32_t semihosting_read(target_s *const target, const semihosting_s *const requ
 {
 	const target_addr_t buf_taddr = request->params[1];
 	const uint32_t buf_len = request->params[2];
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (buf_len == 0)
 		return 0;
 #endif
@@ -443,16 +451,16 @@ int32_t semihosting_read(target_s *const target, const semihosting_s *const requ
 		/* Clamp the requested amount to the amount we actually have left */
 		const uint32_t amount = MIN(buf_len, SEMIHOSTING_FEATURES_LENGTH - semihosting_features_offset);
 		/* Copy the chunk requested to the target, updating our internal offset */
-		target_mem_write(target, buf_taddr, semihosting_features + semihosting_features_offset, amount);
+		target_mem32_write(target, buf_taddr, semihosting_features + semihosting_features_offset, amount);
 		semihosting_features_offset += amount;
 		/* Return how much was left from what we transferred */
-		return buf_len - amount;
+		return (int32_t)(buf_len - amount);
 	}
 
 	const int32_t fd = request->params[0] - 1;
 	const int32_t result = semihosting_remote_read(target, fd, buf_taddr, buf_len);
 	if (result >= 0)
-		return buf_len - result;
+		return (int32_t)(buf_len - result);
 	return result;
 }
 
@@ -465,7 +473,7 @@ int32_t semihosting_write(target_s *const target, const semihosting_s *const req
 	const int32_t fd = request->params[0] - 1;
 	const target_addr_t buf_taddr = request->params[1];
 	const uint32_t buf_len = request->params[2];
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (buf_len == 0)
 		return 0;
 #endif
@@ -487,7 +495,7 @@ int32_t semihosting_write0(target_s *const target, const semihosting_s *const re
 {
 	const target_addr_t str_begin_taddr = request->r1;
 	target_addr_t str_end_taddr;
-	for (str_end_taddr = str_begin_taddr; target_mem_read8(target, str_end_taddr) != 0; ++str_end_taddr) {
+	for (str_end_taddr = str_begin_taddr; target_mem32_read8(target, str_end_taddr) != 0; ++str_end_taddr) {
 		if (target_check_error(target))
 			break;
 	}
@@ -503,7 +511,7 @@ int32_t semihosting_write0(target_s *const target, const semihosting_s *const re
 int32_t semihosting_isatty(target_s *const target, const semihosting_s *const request)
 {
 	const int32_t fd = request->params[0] - 1;
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (!target->stdout_redirected || fd > STDERR_FILENO) {
 		const int32_t result = isatty(fd);
 		target->tc->gdb_errno = semihosting_errno();
@@ -526,7 +534,7 @@ int32_t semihosting_seek(target_s *const target, const semihosting_s *const requ
 			semihosting_features_offset = SEMIHOSTING_FEATURES_LENGTH;
 		return 0;
 	}
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (!target->stdout_redirected || fd > STDERR_FILENO) {
 		const int32_t result = lseek(fd, offset, SEEK_SET) == offset ? 0 : -1;
 		target->tc->gdb_errno = semihosting_errno();
@@ -539,19 +547,25 @@ int32_t semihosting_seek(target_s *const target, const semihosting_s *const requ
 
 int32_t semihosting_rename(target_s *const target, const semihosting_s *const request)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	const char *const old_file_name = semihosting_read_string(target, request->params[0], request->params[1]);
 	if (old_file_name == NULL)
 		return -1;
 	const char *const new_file_name = semihosting_read_string(target, request->params[2], request->params[3]);
 	if (new_file_name == NULL) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
 		free((void *)old_file_name);
+#pragma GCC diagnostic pop
 		return -1;
 	}
 	const int32_t result = rename(old_file_name, new_file_name);
 	target->tc->gdb_errno = semihosting_errno();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
 	free((void *)old_file_name);
 	free((void *)new_file_name);
+#pragma GCC diagnostic pop
 	return result;
 #else
 	gdb_putpacket_f("Frename,%08" PRIX32 "/%08" PRIX32 ",%08" PRIX32 "/%08" PRIX32, request->params[0],
@@ -562,13 +576,16 @@ int32_t semihosting_rename(target_s *const target, const semihosting_s *const re
 
 int32_t semihosting_remove(target_s *const target, const semihosting_s *const request)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	const char *const file_name = semihosting_read_string(target, request->params[0], request->params[1]);
 	if (file_name == NULL)
 		return -1;
 	const int32_t result = remove(file_name);
 	target->tc->gdb_errno = semihosting_errno();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
 	free((void *)file_name);
+#pragma GCC diagnostic pop
 	return result;
 #else
 	gdb_putpacket_f("Funlink,%08" PRIX32 "/%08" PRIX32, request->params[0], request->params[1] + 1U);
@@ -590,7 +607,7 @@ int32_t semihosting_file_length(target_s *const target, const semihosting_s *con
 		return SEMIHOSTING_FEATURES_LENGTH;
 
 	const int32_t fd = request->params[0] - 1;
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (!target->stdout_redirected || fd > STDERR_FILENO) {
 		struct stat file_stat;
 		const bool result = fstat(fd, &file_stat) == 0;
@@ -624,7 +641,7 @@ int32_t semihosting_file_length(target_s *const target, const semihosting_s *con
 	return result;
 }
 
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 semihosting_time_s semihosting_get_time(target_s *const target)
 {
 	/* Provide space for reciving a fio_timeval structure from GDB */
@@ -647,7 +664,7 @@ semihosting_time_s semihosting_get_time(target_s *const target)
 
 int32_t semihosting_clock(target_s *const target)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	/* NB: Can't use clock() because that would give cpu time of BMDA process */
 	struct timeval current_time;
 	/* Get the current time from the host */
@@ -682,7 +699,7 @@ int32_t semihosting_clock(target_s *const target)
 
 int32_t semihosting_time(target_s *const target)
 {
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	/* Get the current time in seconds from the host */
 	int32_t result = (int32_t)time(NULL);
 	target->tc->gdb_errno = semihosting_errno();
@@ -696,6 +713,20 @@ int32_t semihosting_time(target_s *const target)
 	 */
 	return (int32_t)current_time.seconds;
 #endif
+}
+
+int32_t semihosting_elapsed(target_s *const target, const semihosting_s *const request)
+{
+	/* Extract where the write should occur to */
+	const target_addr_t block_taddr = request->r1;
+	/*
+	 * Acquire platform ticks (even if uint32_t ATM).
+	 * BMP: SysTicks. This is faster (on-probe) than talking to GDB.
+	 * BMDA: gettimeofday() as milliseconds.
+	 */
+	const uint64_t elapsed = platform_time_ms();
+	/* Write the elapsed ticks to the target as a pair of uint32_t in LE order per ABI */
+	return target_mem32_write(target, block_taddr, &elapsed, sizeof(elapsed)) ? -1 : 0;
 }
 
 int32_t semihosting_readc(target_s *const target)
@@ -722,7 +753,7 @@ int32_t semihosting_exit(target_s *const target, const semihosting_exit_reason_e
 	if (reason == EXIT_REASON_APPLICATION_EXIT)
 		tc_printf(target, "exit(%" PRIu32 ")\n", status_code);
 	else
-		tc_printf(target, "Exception trapped: %" PRIx32 " (%" PRIu32 ")\n", reason, status_code);
+		tc_printf(target, "Exception trapped: %x (%" PRIu32 ")\n", reason, status_code);
 	target_halt_resume(target, true);
 	return 0;
 }
@@ -737,10 +768,9 @@ int32_t semihosting_get_command_line(target_s *const target, const semihosting_s
 	/* Check that we won't exceed the target buffer with the write */
 	if (command_line_length > buffer_length ||
 		/* Try to write the data to the target along with the actual length value */
-		target_mem_write(target, buffer_taddr, target->cmdline, command_line_length))
+		target_mem32_write(target, buffer_taddr, target->cmdline, command_line_length))
 		return -1;
-	target_mem_write32(target, request->r1 + 4U, command_line_length);
-	return target_check_error(target) ? -1 : 0;
+	return target_mem32_write32(target, request->r1 + 4U, command_line_length) ? -1 : 0;
 }
 
 int32_t semihosting_is_error(const semihosting_errno_e code)
@@ -765,7 +795,7 @@ int32_t semihosting_heap_info(target_s *const target, const semihosting_s *const
 	 * See https://github.com/ARM-software/abi-aa/blob/main/semihosting/semihosting.rst#69sys_heapinfo-0x16
 	 * for more information on the layout of is block and the significance of how this is structured
 	 */
-	return target_mem_write(target, block_taddr, target->heapinfo, sizeof(target->heapinfo)) ? -1 : 0;
+	return target_mem32_write(target, block_taddr, target->heapinfo, sizeof(target->heapinfo)) ? -1 : 0;
 }
 
 int32_t semihosting_temp_name(target_s *const target, const semihosting_s *const request)
@@ -783,7 +813,7 @@ int32_t semihosting_temp_name(target_s *const target, const semihosting_s *const
 	if (buffer_length < sizeof(file_name))
 		return -1;
 	/* If we have enough space, attempt the write back */
-	return target_mem_write(target, buffer_taddr, file_name, SEMIHOSTING_TEMPNAME_LENGTH) ? -1 : 0;
+	return target_mem32_write(target, buffer_taddr, file_name, SEMIHOSTING_TEMPNAME_LENGTH) ? -1 : 0;
 }
 
 int32_t semihosting_handle_request(target_s *const target, const semihosting_s *const request, const uint32_t syscall)
@@ -856,9 +886,13 @@ int32_t semihosting_handle_request(target_s *const target, const semihosting_s *
 	case SEMIHOSTING_SYS_TMPNAM:
 		return semihosting_temp_name(target, request);
 
-	// not implemented yet:
-	case SEMIHOSTING_SYS_ELAPSED:  /* elapsed */
-	case SEMIHOSTING_SYS_TICKFREQ: /* tickfreq */
+	case SEMIHOSTING_SYS_ELAPSED:
+		return semihosting_elapsed(target, request);
+
+	case SEMIHOSTING_SYS_TICKFREQ:
+		/* 1000 Hz SysTick, or BMDA "precision". Servicing breakpoints over SWD is not fast. */
+		return SYSTICKHZ;
+
 	default:
 		return -1;
 	}
@@ -872,7 +906,7 @@ int32_t semihosting_request(target_s *const target, const uint32_t syscall, cons
 	/* Set up the request block appropriately */
 	semihosting_s request = {r1, {0U}};
 	if (syscall != SEMIHOSTING_SYS_EXIT)
-		target_mem_read(target, request.params, r1, sizeof(request.params));
+		target_mem32_read(target, request.params, r1, sizeof(request.params));
 
 #if ENABLE_DEBUG == 1
 	const char *syscall_descr = NULL;
@@ -885,7 +919,7 @@ int32_t semihosting_request(target_s *const target, const uint32_t syscall, cons
 		request.params[1], request.params[2], request.params[3]);
 #endif
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (syscall != SEMIHOSTING_SYS_ERRNO)
 		target->tc->gdb_errno = TARGET_SUCCESS;
 #endif

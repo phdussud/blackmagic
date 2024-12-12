@@ -29,10 +29,12 @@ extern uint16_t usb_config;
 
 #if defined(USB_HS)
 #define CDCACM_PACKET_SIZE  512U
-#define TRACE_ENDPOINT_SIZE 512U
+#define SWO_ENDPOINT_SIZE   512U
+#define NUM_SWO_USB_PACKETS 16U /* 8KiB of data buffer */
 #else
 #define CDCACM_PACKET_SIZE  64U
-#define TRACE_ENDPOINT_SIZE 64U
+#define SWO_ENDPOINT_SIZE   64U
+#define NUM_SWO_USB_PACKETS 4U /* 512B of data buffer */
 #endif
 
 #if !defined(USB_MAX_INTERVAL)
@@ -40,14 +42,24 @@ extern uint16_t usb_config;
 #endif
 
 #define CDCACM_GDB_ENDPOINT  1U
-#define CDCACM_UART_ENDPOINT 3U
-#define TRACE_ENDPOINT       5U
+#define CDCACM_UART_ENDPOINT 2U
+#define SWO_ENDPOINT         3U
+/*
+ * AN4879, table 6: most STM32F4 families (excluding F412, F413, F423)
+ * have OTG_FS DWC2 configured with "4 bidirectional endpoints" (including EP0),
+ * meaning EP1IN, EP1OUT, EP2IN, EP2OUT, EP3IN, EP3OUT are fair game,
+ * but EP4 and anything above will never produce responses from the device,
+ * which the host may observe as STALL. This is an issue for in-tree platforms
+ * such as 96b_carbon, blackpill-f4, f4discovery, hydrabus.
+ */
+#define CDCACM_GDB_NOTIF_ENDPOINT  4U
+#define CDCACM_UART_NOTIF_ENDPOINT 5U
 
 #define GDB_IF_NO  0U
 #define UART_IF_NO 2U
 #define DFU_IF_NO  4U
 #ifdef PLATFORM_HAS_TRACESWO
-#define TRACE_IF_NO      5U
+#define SWO_IF_NO        5U
 #define TOTAL_INTERFACES 6U
 #else
 #define TOTAL_INTERFACES 5U

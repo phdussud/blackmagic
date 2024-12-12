@@ -31,22 +31,23 @@
 #include "target.h"
 #include "target_internal.h"
 
-uint8_t make_packet_request(uint8_t RnW, uint16_t addr)
+uint8_t make_packet_request(const uint8_t rnw, const uint16_t addr)
 {
-	bool APnDP = addr & ADIV5_APnDP;
+	/* Start out with the park and start bits in the request byte */
+	uint8_t request = 0x81U;
 
-	addr &= 0xffU;
-
-	uint8_t request = 0x81U; /* Park and Startbit */
-
-	if (APnDP)
+	/* If we're wanting to talk with an AP, set the APnDP bit and parity */
+	if (addr & ADIV5_APnDP)
 		request ^= 0x22U;
-	if (RnW)
+	/* If we're making a read request, set the RnW bit and flip the parity */
+	if (rnw)
 		request ^= 0x24U;
 
-	addr &= 0xcU;
-	request |= (addr << 1U) & 0x18U;
-	if (addr == 4U || addr == 8U)
+	/* Now grab A[2:3] and encode those */
+	const uint8_t reg = addr & 0x0cU;
+	request |= (reg << 1U) & 0x18U;
+	/* Then adjust the parity again accordingly */
+	if (reg == 4U || reg == 8U)
 		request ^= 0x20U;
 
 	return request;
@@ -74,11 +75,19 @@ static void dormant_to_swd_sequence(void)
 	 * §5.3.4 Switching out of Dormant state
 	 */
 
-	DEBUG_INFO("Switching out of dormant state into SWD\n");
-
 	/* Send at least 8 SWCLKTCK cycles with SWDIOTMS HIGH */
 	swd_line_reset_sequence(false);
+
+	/*
+	 * If the target is both JTAG and SWD with JTAG as default, switch JTAG->DS first.
+	 * See B5.3.2
+	 */
+	DEBUG_INFO("Switching from JTAG to dormant\n");
+	swd_proc.seq_out(ADIV5_JTAG_TO_DORMANT_SEQUENCE0, 5U);
+	swd_proc.seq_out(ADIV5_JTAG_TO_DORMANT_SEQUENCE1, 31U);
+	swd_proc.seq_out(ADIV5_JTAG_TO_DORMANT_SEQUENCE2, 8U);
 	/* Send the 128-bit Selection Alert sequence on SWDIOTMS */
+	DEBUG_INFO("Switching out of dormant state into SWD\n");
 	swd_proc.seq_out(ADIV5_SELECTION_ALERT_SEQUENCE_0, 32U);
 	swd_proc.seq_out(ADIV5_SELECTION_ALERT_SEQUENCE_1, 32U);
 	swd_proc.seq_out(ADIV5_SELECTION_ALERT_SEQUENCE_2, 32U);
@@ -132,7 +141,7 @@ bool adiv5_swd_write_no_check(const uint16_t addr, const uint32_t data)
 	const uint8_t res = swd_proc.seq_in(3U);
 	swd_proc.seq_out_parity(data, 32U);
 	swd_proc.seq_out(0, 8U);
-	return res != SWDP_ACK_OK;
+	return res != SWD_ACK_OK;
 }
 
 uint32_t adiv5_swd_read_no_check(const uint16_t addr)
@@ -143,7 +152,7 @@ uint32_t adiv5_swd_read_no_check(const uint16_t addr)
 	uint32_t data = 0;
 	swd_proc.seq_in_parity(&data, 32U);
 	swd_proc.seq_out(0, 8U);
-	return res == SWDP_ACK_OK ? data : 0;
+	return res == SWD_ACK_OK ? data : 0;
 }
 
 bool adiv5_swd_scan(const uint32_t targetid)
@@ -159,12 +168,12 @@ bool adiv5_swd_scan(const uint32_t targetid)
 
 	dp->write_no_check = adiv5_swd_write_no_check;
 	dp->read_no_check = adiv5_swd_read_no_check;
+	dp->dp_read = adiv5_swd_read;
+	dp->low_access = adiv5_swd_raw_access;
 	dp->error = adiv5_swd_clear_error;
-	dp->dp_read = firmware_swdp_read;
-	dp->low_access = firmware_swdp_low_access;
-	dp->abort = firmware_swdp_abort;
+	dp->abort = adiv5_swd_abort;
 
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 	swdptap_init();
 #else
 	if (!bmda_swd_dp_init(dp)) {
@@ -233,13 +242,13 @@ bool adiv5_swd_scan(const uint32_t targetid)
 	}
 
 	/* If we were given targetid or we have a DPv2+ device, do a multi-drop scan */
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 	/* On non hosted platforms, scan_multidrop can be constant */
 	const
 #endif
 		bool scan_multidrop = targetid || dp->version >= 2U;
 
-#if PC_HOSTED == 1
+#if CONFIG_BMDA == 1
 	if (scan_multidrop && !dp->write_no_check) {
 		DEBUG_WARN("Discovered multi-drop enabled target but CMSIS_DAP < v1.2 cannot handle multi-drop\n");
 		scan_multidrop = false;
@@ -312,14 +321,14 @@ void adiv5_swd_multidrop_scan(adiv5_debug_port_s *const dp, const uint32_t targe
 
 		/* Allocate a new target DP for this instance */
 		adiv5_debug_port_s *const target_dp = calloc(1, sizeof(*dp));
-		if (!dp) { /* calloc failed: heap exhaustion */
+		if (!target_dp) { /* calloc failed: heap exhaustion */
 			DEBUG_ERROR("calloc: failed in %s\n", __func__);
 			break;
 		}
 
 		/* Populate the target DP from the initial one */
 		memcpy(target_dp, dp, sizeof(*dp));
-		target_dp->instance = instance;
+		target_dp->dev_index = instance;
 
 		/* Yield the target DP to adiv5_dp_init */
 		adiv5_dp_abort(target_dp, ADIV5_DP_ABORT_STKERRCLR);
@@ -330,7 +339,7 @@ void adiv5_swd_multidrop_scan(adiv5_debug_port_s *const dp, const uint32_t targe
 	free(dp);
 }
 
-uint32_t firmware_swdp_read(adiv5_debug_port_s *dp, uint16_t addr)
+uint32_t adiv5_swd_read(adiv5_debug_port_s *dp, uint16_t addr)
 {
 	if (addr & ADIV5_APnDP) {
 		adiv5_dp_recoverable_access(dp, ADIV5_LOW_READ, addr, 0);
@@ -375,20 +384,20 @@ uint32_t adiv5_swd_clear_error(adiv5_debug_port_s *const dp, const bool protocol
 	return err;
 }
 
-uint32_t firmware_swdp_low_access(adiv5_debug_port_s *dp, const uint8_t RnW, const uint16_t addr, const uint32_t value)
+uint32_t adiv5_swd_raw_access(adiv5_debug_port_s *dp, const uint8_t rnw, const uint16_t addr, const uint32_t value)
 {
 	if ((addr & ADIV5_APnDP) && dp->fault)
 		return 0;
 
-	const uint8_t request = make_packet_request(RnW, addr);
+	const uint8_t request = make_packet_request(rnw, addr);
 	uint32_t response = 0;
-	uint8_t ack = SWDP_ACK_WAIT;
+	uint8_t ack = SWD_ACK_WAIT;
 	platform_timeout_s timeout;
 	platform_timeout_set(&timeout, 250U);
 	do {
 		swd_proc.seq_out(request, 8U);
 		ack = swd_proc.seq_in(3U);
-		if (ack == SWDP_ACK_FAULT) {
+		if (ack == SWD_ACK_FAULT) {
 			DEBUG_ERROR("SWD access resulted in fault, retrying\n");
 			/* On fault, abort the request and repeat */
 			/* Yes, this is self-recursive.. no, we can't think of a better option */
@@ -396,34 +405,34 @@ uint32_t firmware_swdp_low_access(adiv5_debug_port_s *dp, const uint8_t RnW, con
 				ADIV5_DP_ABORT_ORUNERRCLR | ADIV5_DP_ABORT_WDERRCLR | ADIV5_DP_ABORT_STKERRCLR |
 					ADIV5_DP_ABORT_STKCMPCLR);
 		}
-	} while ((ack == SWDP_ACK_WAIT || ack == SWDP_ACK_FAULT) && !platform_timeout_is_expired(&timeout));
+	} while ((ack == SWD_ACK_WAIT || ack == SWD_ACK_FAULT) && !platform_timeout_is_expired(&timeout));
 
-	if (ack == SWDP_ACK_WAIT) {
+	if (ack == SWD_ACK_WAIT) {
 		DEBUG_ERROR("SWD access resulted in wait, aborting\n");
 		dp->abort(dp, ADIV5_DP_ABORT_DAPABORT);
 		dp->fault = ack;
 		return 0;
 	}
 
-	if (ack == SWDP_ACK_FAULT) {
+	if (ack == SWD_ACK_FAULT) {
 		DEBUG_ERROR("SWD access resulted in fault\n");
 		dp->fault = ack;
 		return 0;
 	}
 
-	if (ack == SWDP_ACK_NO_RESPONSE) {
+	if (ack == SWD_ACK_NO_RESPONSE) {
 		DEBUG_ERROR("SWD access resulted in no response\n");
 		dp->fault = ack;
 		return 0;
 	}
 
-	if (ack != SWDP_ACK_OK) {
+	if (ack != SWD_ACK_OK) {
 		DEBUG_ERROR("SWD access has invalid ack %x\n", ack);
 		raise_exception(EXCEPTION_ERROR, "SWD invalid ACK");
 	}
 
-	if (RnW) {
-		if (swd_proc.seq_in_parity(&response, 32U)) { /* Give up on parity error */
+	if (rnw) {
+		if (!swd_proc.seq_in_parity(&response, 32U)) { /* Give up on parity error */
 			dp->fault = 1U;
 			DEBUG_ERROR("SWD access resulted in parity error\n");
 			raise_exception(EXCEPTION_ERROR, "SWD parity error");
@@ -445,7 +454,7 @@ uint32_t firmware_swdp_low_access(adiv5_debug_port_s *dp, const uint8_t RnW, con
 	return response;
 }
 
-void firmware_swdp_abort(adiv5_debug_port_s *dp, uint32_t abort)
+void adiv5_swd_abort(adiv5_debug_port_s *dp, uint32_t abort)
 {
 	adiv5_dp_write(dp, ADIV5_DP_ABORT, abort);
 }

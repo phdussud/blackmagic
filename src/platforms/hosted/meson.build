@@ -58,7 +58,7 @@ bmda_sources = files(
 subdir('remote')
 
 bmda_args = [
-	'-DPC_HOSTED=1',
+	'-DCONFIG_BMDA=1',
 	'-DHOSTED_BMP_ONLY=0',
 	# XXX: These need removing and the warnings they're covering up fixing
 	'-Wno-format-nonliteral',
@@ -102,8 +102,10 @@ if build_machine.system() == 'windows' and cc.get_define('__MINGW32__') == '1'
 			bmda_link_args += ['-mcrtdll=ucrt']
 		endif
 	else
-		bmda_args += ['-mcrtdll=msvcrt']
-		bmda_link_args += ['-mcrtdll=msvcrt']
+		# Check for GCCs built for Windows but which have been built stupid (don't understand the -mcrtdll option)
+		mcrtdll = cc.get_supported_arguments('-mcrtdll=msvcrt')
+		bmda_args += mcrtdll
+		bmda_link_args += mcrtdll
 	endif
 endif
 
@@ -170,6 +172,7 @@ if build_machine.system() == 'linux'
 		fallback: ['hidapi', 'hidapi_hidraw_dep'],
 		native: is_cross_build,
 		default_options: [
+			'c_std=gnu99',
 			'default_library=static',
 			'install_targets=false',
 			'with_libusb=false',
@@ -185,6 +188,7 @@ else
 		fallback: 'hidapi',
 		native: is_cross_build,
 		default_options: [
+			'c_std=c99',
 			'default_library=static',
 			'install_targets=false',
 			'build_native=true',

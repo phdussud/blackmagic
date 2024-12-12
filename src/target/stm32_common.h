@@ -25,8 +25,10 @@
 #include "general.h"
 #include "target_internal.h"
 #include "adiv5.h"
-
 // IWYU pragma: end_keep
+
+// Make the command list for STM32F1 parts available for, eg, CH32F1
+extern const command_s stm32f1_cmd_list[];
 
 static inline const char *stm32_psize_to_string(const align_e psize)
 {
@@ -58,5 +60,7 @@ static inline bool stm32_psize_from_string(target_s *t, const char *const str, a
 	}
 	return true;
 }
+
+bool stm32_uid(target_s *const target, target_addr_t uid_base);
 
 #endif /*TARGET_STM32_COMMON_H*/

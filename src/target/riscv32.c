@@ -68,8 +68,8 @@ typedef struct riscv32_regs {
 #define RV32_MATCH_BEFORE 0x00000000U
 #define RV32_MATCH_AFTER  0x00040000U
 
-static size_t riscv32_reg_read(target_s *target, uint32_t c, void *data, size_t max);
-static size_t riscv32_reg_write(target_s *target, uint32_t c, const void *data, size_t max);
+static size_t riscv32_reg_read(target_s *target, uint32_t reg, void *data, size_t max);
+static size_t riscv32_reg_write(target_s *target, uint32_t reg, const void *data, size_t max);
 static void riscv32_regs_read(target_s *target, void *data);
 static void riscv32_regs_write(target_s *target, const void *data);
 
@@ -96,9 +96,14 @@ bool riscv32_probe(target_s *const target)
 	case JEP106_MANUFACTURER_RV_GIGADEVICE:
 		PROBE(gd32vf1_probe);
 		break;
+	case JEP106_MANUFACTURER_RASPBERRY:
+		PROBE(rp2350_probe);
+		break;
+	default:
+		break;
 	}
 
-#if PC_HOSTED == 0
+#if CONFIG_BMDA == 0
 	gdb_outf("Please report unknown device with Designer 0x%x\n", target->designer_code);
 #else
 	DEBUG_WARN("Please report unknown device with Designer 0x%x\n", target->designer_code);
@@ -125,7 +130,7 @@ static void riscv32_regs_write(target_s *const target, const void *const data)
 {
 	/* Grab the hart structure and figure out how many registers need reading out */
 	riscv_hart_s *const hart = riscv_hart_struct(target);
-	riscv32_regs_s *const regs = (riscv32_regs_s *)data;
+	const riscv32_regs_s *const regs = (const riscv32_regs_s *)data;
 	const size_t gprs_count = hart->extensions & RV_ISA_EXT_EMBEDDED ? 16U : 32U;
 	/* Loop through writing out the GPRs, except for the first which is always 0 */
 	for (size_t gpr = 1; gpr < gprs_count; ++gpr) {
@@ -138,7 +143,7 @@ static void riscv32_regs_write(target_s *const target, const void *const data)
 
 static inline size_t riscv32_bool_to_4(const bool ret)
 {
-	return ret ? 4 : 0;
+	return ret ? 4U : 0U;
 }
 
 static size_t riscv32_reg_read(target_s *target, const uint32_t reg, void *data, const size_t max)
@@ -193,6 +198,8 @@ void riscv32_unpack_data(void *const dest, const uint32_t data, const uint8_t ac
 	case RV_MEM_ACCESS_32_BIT:
 		memcpy(dest, &data, sizeof(data));
 		break;
+	default:
+		break;
 	}
 }
 
@@ -215,6 +222,8 @@ uint32_t riscv32_pack_data(const void *const src, const uint8_t access_width)
 		memcpy(&value, src, sizeof(value));
 		return value;
 	}
+	default:
+		break;
 	}
 	return 0;
 }
@@ -353,6 +362,8 @@ static void riscv32_sysbus_mem_adjusted_read(riscv_hart_s *const hart, void *con
 			adiv5_unpack_data(data, src + adjustment, value, ALIGN_8BIT);
 		break;
 	}
+	default:
+		break;
 	}
 }
 
@@ -492,6 +503,8 @@ static void riscv32_sysbus_mem_adjusted_write(riscv_hart_s *const hart, const ta
 			hart, dest & alignment, &value, native_access_length, RV_MEM_ACCESS_32_BIT, native_access_length);
 		break;
 	}
+	default:
+		break;
 	}
 }
 
@@ -551,11 +564,11 @@ static void riscv32_sysbus_mem_write(
 		riscv32_sysbus_mem_adjusted_write(hart, address, data, remainder, native_access_width, native_access_length);
 }
 
-void riscv32_mem_read(target_s *const target, void *const dest, const target_addr_t src, const size_t len)
+void riscv32_mem_read(target_s *const target, void *const dest, const target_addr64_t src, const size_t len)
 {
 	/* If we're asked to do a 0-byte read, do nothing */
 	if (!len) {
-		DEBUG_PROTO("%s: @ %08" PRIx32 " len %zu\n", __func__, src, len);
+		DEBUG_PROTO("%s: @ %08" PRIx32 " len %zu\n", __func__, (uint32_t)src, len);
 		return;
 	}
 
@@ -566,7 +579,7 @@ void riscv32_mem_read(target_s *const target, void *const dest, const target_add
 		riscv32_abstract_mem_read(hart, dest, src, len);
 
 #if ENABLE_DEBUG
-	DEBUG_PROTO("%s: @ %08" PRIx32 " len %zu:", __func__, src, len);
+	DEBUG_PROTO("%s: @ %08" PRIx32 " len %zu:", __func__, (uint32_t)src, len);
 #ifndef DEBUG_PROTO_IS_NOOP
 	const uint8_t *const data = (const uint8_t *)dest;
 #endif
@@ -581,10 +594,10 @@ void riscv32_mem_read(target_s *const target, void *const dest, const target_add
 #endif
 }
 
-void riscv32_mem_write(target_s *const target, const target_addr_t dest, const void *const src, const size_t len)
+void riscv32_mem_write(target_s *const target, const target_addr64_t dest, const void *const src, const size_t len)
 {
 #if ENABLE_DEBUG
-	DEBUG_PROTO("%s: @ %" PRIx32 " len %zu:", __func__, dest, len);
+	DEBUG_PROTO("%s: @ %" PRIx32 " len %zu:", __func__, (uint32_t)dest, len);
 #ifndef DEBUG_PROTO_IS_NOOP
 	const uint8_t *const data = (const uint8_t *)src;
 #endif

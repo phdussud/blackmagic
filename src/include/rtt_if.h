@@ -34,7 +34,7 @@
  */
 #include "platform.h"
 
-#if PC_HOSTED == 0 && !defined(NO_LIBOPENCM3)
+#if CONFIG_BMDA == 0 && !defined(NO_LIBOPENCM3)
 #include <libopencm3/usb/usbd.h>
 
 /* usb rx callback */
@@ -45,7 +45,7 @@ void rtt_serial_receive_callback(usbd_device *dev, uint8_t ep);
 /* override RTT_UP_BUF_SIZE and RTT_DOWN_BUF_SIZE in platform.h if needed */
 
 #if !defined(RTT_UP_BUF_SIZE) || !defined(RTT_DOWN_BUF_SIZE)
-#if (PC_HOSTED == 1)
+#if (CONFIG_BMDA == 1)
 #define RTT_UP_BUF_SIZE   (4096U + 8U)
 #define RTT_DOWN_BUF_SIZE 512U
 #elif defined(STM32F7)
@@ -65,11 +65,11 @@ int rtt_if_init(void);
 /* hosted teardown */
 int rtt_if_exit(void);
 
-/* target to host: write len bytes from the buffer starting at buf. return number bytes written */
-uint32_t rtt_write(const char *buf, uint32_t len);
-/* host to target: read one character, non-blocking. return character, -1 if no character */
-int32_t rtt_getchar(void);
-/* host to target: true if no characters available for reading */
-bool rtt_nodata(void);
+/* target to host: write len bytes from the buffer on the channel starting at buf. return number bytes written */
+uint32_t rtt_write(const uint32_t channel, const char *buf, uint32_t len);
+/* host to target: read one character from the channel, non-blocking. return character, -1 if no character */
+int32_t rtt_getchar(const uint32_t channel);
+/* host to target: true if no characters available for reading in the selected channel */
+bool rtt_nodata(const uint32_t channel);
 
 #endif /* INCLUDE_RTT_IF_H */
