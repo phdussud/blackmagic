@@ -1,0 +1,73 @@
+/*
+ * This file is part of the Black Magic Debug project.
+ *
+ * Copyright (C) 2023  Black Sphere Technologies Ltd.
+ * Written by Patrick Dussud <phdussud@hotmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+.program swdp
+.side_set 1 opt
+
+/*
+public out_negedge:
+    set pindirs, 1 side 0x0 ; Init OE clock 0
+int_out_negedge:
+    pull           ; Pull number of bits to shift -1 from tx fifo and put into output shift register
+    mov x, osr     ; mov bits to shift -1 from output shift register into x
+    pull           ; Pull data to shift out
+out_negedge_bitloop:
+    out pins, 1                  side 0x0 ; clock data out on falling edge
+    jmp  x-- out_negedge_bitloop side 0x1 ; data is present for posedge
+    set pins, 1                  side 0x0 ; Drive data high (idle bus state)
+    push                                 ; Push to rx fifo just so processor knows when done
+    jmp int_out_negedge                  ; Wait for next transaction
+
+public in_posedge:
+    set pindirs, 0 side 0x0 ; INIT IE clock 0
+int_in_posedge:
+    pull                   ; Pull number of bits to shift -1 from tx fifo and put into output shift register
+    mov x, osr             ; mov bits to shift -1 from output shift register into x into x
+in_posedge_bitloop:
+    in pins, 1                        side 0x1 ; Generate posedge and read data
+    jmp x-- in_posedge_bitloop        side 0x0 ;
+    push                                      ; Push to rx fifo when done
+    jmp int_in_posedge                        ; Jump back to start
+*/
+
+public out_negedge:
+    set pindirs, 1 side 0x0 ; Init OE clock 0
+    pull           ; Pull number of bits to shift -1 from tx fifo and put into output shift register
+    mov x, osr     ; mov bits to shift -1 from output shift register into x
+    pull           ; Pull data to shift out
+out_negedge_bitloop:
+    mov y,y                      side 0x0       ; falling edge
+    out pins, 1                  side 0x0       ; clock data out 
+    jmp  x-- out_negedge_bitloop side 0x1 [1]   ; data is present for posedge
+    set pins, 1                  side 0x0       ; Drive data high (idle bus state)
+    push                                        ; Push to rx fifo just so processor knows when done
+    jmp out_negedge                             ; Wait for next transaction
+
+public in_posedge:
+    set pindirs, 0 side 0x0 ; INIT IE clock 0
+    pull                   ; Pull number of bits to shift -1 from tx fifo and put into output shift register
+    mov x, osr             ; mov bits to shift -1 from output shift register into x into x
+in_posedge_bitloop:
+    mov y,y                    side 0x0         ; falling edge
+    in pins, 1                 side 0x0         ; read data
+    jmp x-- in_posedge_bitloop side 0x1 [1]     ; Generate posedge
+    push                       side 0x0         ; Push to rx fifo when done
+    jmp in_posedge                              ; Jump back to start
+
