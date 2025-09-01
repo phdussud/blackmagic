@@ -1,7 +1,7 @@
 /*
  * This file is part of the Black Magic Debug project.
  *
- * Copyright (C) 2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2023-2025 1BitSquared <info@1bitsquared.com>
  * Written by Rafael Silva <perigoso@riseup.net>
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,29 +30,24 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef INCLUDE_ALIGN_H
-#define INCLUDE_ALIGN_H
+#include "general.h"
+#include "target_internal.h"
+#include "wchlink.h"
+#include "wchlink_protocol.h"
 
-#include <stdalign.h>
+bool wchlink_rvswd_scan(void)
+{
+	target_list_free();
 
-typedef enum align {
-	ALIGN_8BIT = 0U,
-	ALIGN_16BIT = 1U,
-	ALIGN_32BIT = 2U,
-	ALIGN_64BIT = 3U,
-} align_e;
+	/* 
+	 * This is redundant as we will run a generic scan routine after this
+	 * but without it the scan will fail
+	 */
+	if (!wchlink_attach())
+		return false;
 
-#define ALIGN_OF(x)     (((x) & 3U) == 0 ? ALIGN_32BIT : (((x) & 1U) == 0 ? ALIGN_16BIT : ALIGN_8BIT))
-#define MIN_ALIGN(x, y) MIN(ALIGN_OF(x), ALIGN_OF(y))
+	/* deffer to WCH-Link riscv_dtm_handler */
+	wchlink_riscv_dtm_handler();
 
-#define ALIGN(x, n) (((x) + (n) - 1) & ~((n) - 1))
-
-#define BMD_ALIGN_DEF(x) _Alignas(x)
-
-#ifdef _MSC_VER
-#define BMD_ALIGN_DECL(x) __declspec(align(x))
-#else
-#define BMD_ALIGN_DECL(x) __attribute__((aligned(x)))
-#endif
-
-#endif /* INCLUDE_ALIGN_H */
+	return target_list != NULL;
+}

@@ -77,7 +77,8 @@ if is_firmware_build
 		'riscv64': 'RISC-V 64-bit support',
 		'at32f4': 'Arterytek parts',
 		'apollo3': 'Ambiq Apollo3 parts',
-		'ch32': 'WinChipHead CH32 parts',
+		'ch32': 'WinChipHead CH32 ARM Cortex parts',
+		'ch32v': 'WinChipHead CH32 RISC-V parts',
 		'ch579': 'WinChipHead CH579 parts',
 		'efm': 'Energy Micro parts',
 		'gd32': 'GigaDevice parts',
@@ -122,6 +123,10 @@ endif
 # We declare a dependency for each target group with the source files required
 # these dependencies are then added to the BMD core, conditinal on the targets option
 # NOTE: sourceset module might be an alternative to this method (unexplored)
+target_arm_coresight = declare_dependency(
+	sources: files('arm_coresight_cti.c'),
+)
+
 target_cortex = declare_dependency(
 	sources: files('cortex.c'),
 )
@@ -136,6 +141,11 @@ target_cortexm = declare_dependency(
 	sources: files('cortexm.c'),
 	dependencies: target_cortex,
 	compile_args: ['-DCONFIG_CORTEXM=1'],
+)
+
+target_cortexa_armv8 = declare_dependency(
+	sources: files('cortexa_armv8.c'),
+	dependencies: [target_cortex, target_arm_coresight],
 )
 
 riscv_jtag_dtm = declare_dependency(
@@ -307,6 +317,13 @@ target_ch32 = declare_dependency(
 	dependencies: target_stm32f1,
 )
 
+target_ch32v = declare_dependency(
+	sources: files(
+		'ch32vx.c',
+	),
+	dependencies: target_riscv32,
+)
+
 target_stm = declare_dependency(
 	sources: files(
 		'stm32g0.c',
@@ -393,12 +410,14 @@ libbmd_target_deps = [
 	# Enable all architectures for libbmd
 	target_cortexar,
 	target_cortexm,
+	target_cortexa_armv8,
 	target_riscv32,
 	target_riscv64,
 	# Enable all targets for libbmd
 	target_apollo3,
 	target_at32f4,
 	target_ch32,
+	target_ch32v,
 	target_ch579,
 	target_efm,
 	target_gd32,
