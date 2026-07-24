@@ -20,8 +20,9 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* This file implements Atmel SAM3/4 target specific functions for detecting
- * the device, providing the XML memory map and Flash memory programming.
+/*
+ * This file implements support for Atmel SAM3, SAM4 and SAMx7x series devices, providing
+ * memory maps and Flash programming routines.
  *
  * Supported devices: SAM3N, SAM3S, SAM3U, SAM3X, SAM4S, SAME70, SAMS70, SAMV71, SAMV70
  */
@@ -239,7 +240,7 @@ static void sam_add_flash(target_s *const target, const uint32_t eefc_base, cons
 	target_add_flash(target, target_flash);
 }
 
-static void samx7x_add_ram(target_s *target, uint32_t tcm_config, uint32_t ram_size)
+static void samx7x_add_ram(target_s *const target, const uint32_t tcm_config, const uint32_t ram_size)
 {
 	uint32_t itcm_size = 0;
 	uint32_t dtcm_size = 0;
@@ -254,6 +255,8 @@ static void samx7x_add_ram(target_s *target, uint32_t tcm_config, uint32_t ram_s
 	case GPNVM_SAMX7X_TCM_128K:
 		itcm_size = dtcm_size = 0x20000;
 		break;
+	default:
+		break;
 	}
 
 	if (dtcm_size > 0)
@@ -266,7 +269,7 @@ static void samx7x_add_ram(target_s *target, uint32_t tcm_config, uint32_t ram_s
 		target_add_ram32(target, 0x20400000, sram_size);
 }
 
-static size_t sam_flash_size(uint32_t cidr)
+static size_t sam_flash_size(const uint32_t cidr)
 {
 	switch (cidr & CHIPID_CIDR_NVPSIZ_MASK) {
 	case CHIPID_CIDR_NVPSIZ_8K:
@@ -292,7 +295,7 @@ static size_t sam_flash_size(uint32_t cidr)
 	}
 }
 
-static size_t sam_sram_size(uint32_t cidr)
+static size_t sam_sram_size(const uint32_t cidr)
 {
 	switch (cidr & CHIPID_CIDR_SRAMSIZ_MASK) {
 	case CHIPID_CIDR_SRAMSIZ_256K:
@@ -304,7 +307,7 @@ static size_t sam_sram_size(uint32_t cidr)
 	}
 }
 
-samx7x_descr_s samx7x_parse_id(uint32_t cidr, uint32_t exid)
+samx7x_descr_s samx7x_parse_id(const uint32_t cidr, const uint32_t exid)
 {
 	samx7x_descr_s descr = {0};
 
@@ -324,6 +327,8 @@ samx7x_descr_s samx7x_parse_id(uint32_t cidr, uint32_t exid)
 	case CHIPID_CIDR_ARCH_SAMV70:
 		descr.product_code = 'V';
 		descr.product_id = 70;
+		break;
+	default:
 		break;
 	}
 
@@ -354,6 +359,8 @@ samx7x_descr_s samx7x_parse_id(uint32_t cidr, uint32_t exid)
 	case CHIPID_EXID_SAMX7X_PINS_J:
 		descr.pins = 'J';
 		break;
+	default:
+		break;
 	}
 
 	descr.ram_size = sam_sram_size(cidr);
@@ -376,7 +383,7 @@ samx7x_descr_s samx7x_parse_id(uint32_t cidr, uint32_t exid)
 	return descr;
 }
 
-bool samx7x_probe(target_s *target)
+bool samx7x_probe(target_s *const target)
 {
 	/* Start by reading out the ChipID peripheral's CIDR, and if that indicates there's an EXID, that too */
 	const uint32_t cidr = target_mem32_read32(target, SAM_CHIPID_CIDR);
@@ -441,7 +448,7 @@ bool samx7x_probe(target_s *target)
 	return true;
 }
 
-bool sam3x_probe(target_s *target)
+bool sam3x_probe(target_s *const target)
 {
 	uint32_t cidr = target_mem32_read32(target, SAM_CHIPID_CIDR);
 	size_t size = sam_flash_size(cidr);
@@ -454,9 +461,11 @@ bool sam3x_probe(target_s *target)
 		target_add_ram32(target, 0x20000000, 0x200000);
 		/* 2 Flash memories back-to-back starting at 0x80000 */
 		sam3_add_flash(target, SAM3X_EEFC_BASE(0), 0x80000, size / 2U);
-		sam3_add_flash(target, SAM3X_EEFC_BASE(1U), 0x80000 + size / 2U, size / 2U);
+		sam3_add_flash(target, SAM3X_EEFC_BASE(1U), 0x80000 + (size / 2U), size / 2U);
 		target_add_commands(target, sam_cmd_list, "SAM3X");
 		return true;
+	default:
+		break;
 	}
 
 	cidr = target_mem32_read32(target, SAM34NSU_CHIPID_CIDR);
@@ -504,11 +513,13 @@ bool sam3x_probe(target_s *target)
 			/* Larger devices are split evenly between 2 */
 			sam_add_flash(
 				target, SAM4S_EEFC_BASE(0), 0x400000, size / 2U, SAM_LARGE_PAGE_SIZE, EFFC_FCR_FARG_8PAGE_ERASE);
-			sam_add_flash(target, SAM4S_EEFC_BASE(1U), 0x400000 + size / 2U, size / 2U, SAM_LARGE_PAGE_SIZE,
+			sam_add_flash(target, SAM4S_EEFC_BASE(1U), 0x400000 + (size / 2U), size / 2U, SAM_LARGE_PAGE_SIZE,
 				EFFC_FCR_FARG_8PAGE_ERASE);
 		}
 		target_add_commands(target, sam_cmd_list, "SAM4S");
 		return true;
+	default:
+		break;
 	}
 	return false;
 }
@@ -535,7 +546,7 @@ static bool sam_flash_cmd(target_s *const target, const uint32_t base, const uin
 	return !(status & EEFC_FSR_ERROR);
 }
 
-static sam_driver_e sam_driver(target_s *target)
+static sam_driver_e sam_driver(target_s *const target)
 {
 	if (strcmp(target->driver, "Atmel SAM3X") == 0)
 		return DRIVER_SAM3X;
@@ -548,7 +559,7 @@ static sam_driver_e sam_driver(target_s *target)
 	return DRIVER_SAMX7X;
 }
 
-static bool sam_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len)
+static bool sam_flash_erase(target_flash_s *const flash, const target_addr_t addr, const size_t len)
 {
 	(void)len;
 	target_s *target = flash->t;
@@ -577,7 +588,8 @@ static bool sam3_flash_erase(target_flash_s *flash, target_addr_t addr, size_t l
 	return true;
 }
 
-static bool sam_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len)
+static bool sam_flash_write(
+	target_flash_s *const flash, const target_addr_t dest, const void *const src, const size_t len)
 {
 	target_s *const target = flash->t;
 	sam_flash_s *const sam_flash = (sam_flash_s *)flash;
@@ -607,7 +619,7 @@ static bool sam_mass_erase(target_flash_s *const flash, platform_timeout_s *cons
 	return true;
 }
 
-static bool sam_gpnvm_get(target_s *target, uint32_t base, uint32_t *gpnvm)
+static bool sam_gpnvm_get(target_s *const target, const uint32_t base, uint32_t *const gpnvm)
 {
 	if (!gpnvm || !sam_flash_cmd(target, base, EEFC_FCR_FCMD_GGPB, 0))
 		return false;

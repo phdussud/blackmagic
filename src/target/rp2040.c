@@ -39,9 +39,12 @@
  */
 
 /*
- * This file implements Raspberry Pico (RP2040) target specific functions
- * for detecting the device, providing the XML memory map and
- * Flash memory programming.
+ * This file implements support for the Raspberry Pico 1 (RP2040),
+ * providing memory maps and Flash programming routines.
+ *
+ * References:
+ * RP2040 Datasheet
+ *   https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf
  */
 
 #include "general.h"
@@ -51,15 +54,15 @@
 #include "spi.h"
 #include "sfdp.h"
 
-#define RP_MAX_TABLE_SIZE     0x80U
-#define BOOTROM_MAGIC_ADDR    0x00000010U
-#define BOOTROM_MAGIC         ((uint32_t)'M' | ((uint32_t)'u' << 8U) | (1U << 16U))
-#define BOOTROM_MAGIC_MASK    0x00ffffffU
-#define BOOTROM_VERSION_SHIFT 24U
-#define RP_XIP_FLASH_BASE     0x10000000U
-#define RP_SRAM_BASE          0x20000000U
-#define RP_SRAM_SIZE          0x42000U
-#define RP_STUB_BUFFER_BASE   (RP_SRAM_BASE + 0x1000)
+#define RP_MAX_TABLE_SIZE        0x80U
+#define RP_BOOTROM_MAGIC_ADDR    0x00000010U
+#define RP_BOOTROM_MAGIC         ((uint32_t)'M' | ((uint32_t)'u' << 8U) | (1U << 16U))
+#define RP_BOOTROM_MAGIC_MASK    0x00ffffffU
+#define RP_BOOTROM_VERSION_SHIFT 24U
+#define RP_XIP_FLASH_BASE        0x10000000U
+#define RP_SRAM_BASE             0x20000000U
+#define RP_SRAM_SIZE             0x42000U
+#define RP_STUB_BUFFER_BASE      (RP_SRAM_BASE + 0x1000)
 
 #define RP_REG_ACCESS_NORMAL              0x0000U
 #define RP_REG_ACCESS_WRITE_XOR           0x1000U
@@ -151,16 +154,10 @@
 #define RP_RESETS_RESET_IO_QSPI_BITS   0x00000040U
 #define RP_RESETS_RESET_PADS_QSPI_BITS 0x00000200U
 
-#define BOOTROM_FUNC_TABLE_ADDR      0x00000014U
-#define BOOTROM_FUNC_TABLE_TAG(x, y) ((uint8_t)(x) | ((uint8_t)(y) << 8U))
+#define RP_BOOTROM_FUNC_TABLE_ADDR      0x00000014U
+#define RP_BOOTROM_FUNC_TABLE_TAG(x, y) ((uint8_t)(x) | ((uint8_t)(y) << 8U))
 
-#define FLASHSIZE_4K_SECTOR      (4U * 1024U)
-#define FLASHSIZE_32K_BLOCK      (32U * 1024U)
-#define FLASHSIZE_64K_BLOCK      (64U * 1024U)
-#define FLASHSIZE_32K_BLOCK_MASK ~(FLASHSIZE_32K_BLOCK - 1U)
-#define FLASHSIZE_64K_BLOCK_MASK ~(FLASHSIZE_64K_BLOCK - 1U)
-#define MAX_FLASH                (16U * 1024U * 1024U)
-#define MAX_WRITE_CHUNK          0x1000U
+#define RP2040_MAX_FLASH (16U * 1024U * 1024U)
 
 #define ID_RP2040 0x1002U
 
@@ -203,7 +200,7 @@ static void rp_flash_enter_xip(target_s *target);
 static void rp_flash_connect_internal(target_s *target);
 static void rp_flash_flush_cache(target_s *target);
 
-static void rp_add_flash(target_s *target)
+static void rp_add_flash(target_s *const target)
 {
 	const bool por_state = rp_flash_in_por_state(target);
 	DEBUG_INFO("RP2040 Flash controller %sin POR state, reconfiguring\n", por_state ? "" : "not ");
@@ -212,7 +209,7 @@ static void rp_add_flash(target_s *target)
 	rp_flash_exit_xip(target);
 	rp_spi_config(target);
 
-	spi_flash_s *flash = bmp_spi_add_flash(
+	spi_flash_s *const flash = bmp_spi_add_flash(
 		target, RP_XIP_FLASH_BASE, rp_get_flash_length(target), rp_spi_read, NULL, rp_spi_run_command);
 	flash->flash.write = rp_flash_write;
 
@@ -229,23 +226,23 @@ bool rp2040_probe(target_s *const target)
 		return false;
 
 	/* Check bootrom magic*/
-	uint32_t boot_magic = target_mem32_read32(target, BOOTROM_MAGIC_ADDR);
-	if ((boot_magic & BOOTROM_MAGIC_MASK) != BOOTROM_MAGIC) {
+	const uint32_t boot_magic = target_mem32_read32(target, RP_BOOTROM_MAGIC_ADDR);
+	if ((boot_magic & RP_BOOTROM_MAGIC_MASK) != RP_BOOTROM_MAGIC) {
 		DEBUG_ERROR("Wrong Bootmagic %08" PRIx32 " found!\n", boot_magic);
 		return false;
 	}
 
 #if ENABLE_DEBUG == 1
-	if ((boot_magic >> BOOTROM_VERSION_SHIFT) == 1)
+	if ((boot_magic >> RP_BOOTROM_VERSION_SHIFT) == 1)
 		DEBUG_WARN("Old Bootrom Version 1!\n");
 #endif
 
-	rp_priv_s *priv_storage = calloc(1, sizeof(rp_priv_s));
+	rp_priv_s *const priv_storage = calloc(1, sizeof(rp_priv_s));
 	if (!priv_storage) { /* calloc failed: heap exhaustion */
 		DEBUG_ERROR("calloc: failed in %s\n", __func__);
 		return false;
 	}
-	target->target_storage = (void *)priv_storage;
+	target->target_storage = priv_storage;
 
 	target->driver = "RP2040";
 	target->target_options |= TOPT_INHIBIT_NRST;
@@ -256,7 +253,7 @@ bool rp2040_probe(target_s *const target)
 	return true;
 }
 
-static bool rp_attach(target_s *target)
+static bool rp_attach(target_s *const target)
 {
 	if (!cortexm_attach(target) || !rp_read_rom_func_table(target))
 		return false;
@@ -279,7 +276,7 @@ static bool rp_read_rom_func_table(target_s *const target)
 {
 	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
 	/* We have to do a 32-bit read here but the pointer contained is only 16-bit. */
-	const uint16_t table_offset = target_mem32_read32(target, BOOTROM_FUNC_TABLE_ADDR) & 0x0000ffffU;
+	const uint16_t table_offset = target_mem32_read32(target, RP_BOOTROM_FUNC_TABLE_ADDR) & 0x0000ffffU;
 	uint16_t table[RP_MAX_TABLE_SIZE];
 	if (target_mem32_read(target, table, table_offset, RP_MAX_TABLE_SIZE))
 		return false;
@@ -287,7 +284,7 @@ static bool rp_read_rom_func_table(target_s *const target)
 	for (size_t i = 0; i < RP_MAX_TABLE_SIZE; i += 2U) {
 		const uint16_t tag = table[i];
 		const uint16_t addr = table[i + 1U];
-		if (tag == BOOTROM_FUNC_TABLE_TAG('U', 'B')) {
+		if (tag == RP_BOOTROM_FUNC_TABLE_TAG('U', 'B')) {
 			priv->rom_reset_usb_boot = addr;
 			return true;
 		}
@@ -641,10 +638,10 @@ static uint32_t rp_get_flash_length(target_s *const target)
 		return 1U << flash_id.capacity;
 
 	// Guess maximum flash size
-	return MAX_FLASH;
+	return RP2040_MAX_FLASH;
 }
 
-static bool rp_cmd_erase_sector(target_s *target, int argc, const char **argv)
+static bool rp_cmd_erase_sector(target_s *const target, const int argc, const char **const argv)
 {
 	uint32_t start = target->flash->start;
 	uint32_t length;
@@ -666,32 +663,32 @@ static bool rp_cmd_erase_sector(target_s *target, int argc, const char **argv)
 	return result;
 }
 
-static bool rp_cmd_reset_usb_boot(target_s *t, int argc, const char **argv)
+static bool rp_cmd_reset_usb_boot(target_s *const target, const int argc, const char **const argv)
 {
 	uint32_t regs[20U] = {0};
-	rp_priv_s *ps = (rp_priv_s *)t->target_storage;
+	const rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
 	/* Set up the arguments for the function call */
 	if (argc > 1)
 		regs[0] = strtoul(argv[1], NULL, 0);
 	if (argc > 2)
 		regs[1] = strtoul(argv[2], NULL, 0);
 	/* The USB boot function does not return and takes its arguments in r0 and r1 */
-	regs[CORTEX_REG_PC] = ps->rom_reset_usb_boot;
+	regs[CORTEX_REG_PC] = priv->rom_reset_usb_boot;
 	/* So load the link register with a dummy return address like we just booted the chip */
 	regs[CORTEX_REG_LR] = UINT32_MAX;
 	/* Configure the stack to the end of SRAM and configure the status register for Thumb execution */
 	regs[CORTEX_REG_MSP] = RP_SRAM_BASE + RP_SRAM_SIZE;
 	regs[CORTEX_REG_XPSR] = CORTEXM_XPSR_THUMB;
 	/* Now reconfigure the core with the new execution environment */
-	target_regs_write(t, regs);
+	target_regs_write(target, regs);
 	/* And resume the core */
-	target_halt_resume(t, false);
+	target_halt_resume(target, false);
 	return true;
 }
 
-static bool rp2040_rescue_do_reset(target_s *target)
+static bool rp2040_rescue_do_reset(target_s *const target)
 {
-	adiv5_access_port_s *ap = (adiv5_access_port_s *)target->priv;
+	const adiv5_access_port_s *const ap = (adiv5_access_port_s *)target->priv;
 	const uint32_t ctrl = adiv5_dp_read(ap->dp, ADIV5_DP_CTRLSTAT);
 	adiv5_dp_write(ap->dp, ADIV5_DP_CTRLSTAT, ctrl | ADIV5_DP_CTRLSTAT_CDBGPWRUPREQ);
 	platform_timeout_s timeout;
@@ -715,7 +712,7 @@ static bool rp2040_rescue_do_reset(target_s *target)
  *
  * Attach to this DP will do the reset, but will fail to attach!
  */
-bool rp2040_rescue_probe(adiv5_access_port_s *ap)
+bool rp2040_rescue_probe(adiv5_access_port_s *const ap)
 {
 	target_s *target = target_new();
 	if (!target)

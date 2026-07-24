@@ -2,7 +2,9 @@
  * This file is part of the Black Magic Debug project.
  *
  * Copyright (C) 2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2025 1BitSquared <info@1bitsquared.com>
  * Written by Matthew Via <via@matthewvia.info>
+ * Modified by Rachel Mant <git@dragonmux.network>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,8 +21,8 @@
  */
 
 /*
- * This file implements S32K3xx target specific functions providing
- * the XML memory map and Flash memory programming.
+ * This file implements support for S32K3xx series devices, providing
+ * memory maps and Flash programming routines.
  */
 
 #include "command.h"
@@ -66,32 +68,21 @@
 #define SECTOR_SIZE       8192U
 #define SUPER_SECTOR_SIZE 65536U
 
-static inline uint32_t C40ASF_DATA_REG(const uint32_t x)
-{
-	return 0x402ec100U + (4U * x);
-}
-
-static inline uint32_t C40ASF_SSPELOCK_REG(const uint32_t block)
-{
-	return PFCBLK0_SSPELOCK + (4U * block);
-}
-
-static inline uint32_t C40ASF_SPELOCK_REG(const uint32_t block)
-{
-	return PFCBLK0_SPELOCK + (4U * block);
-}
-
-static bool s32k3xx_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
-static bool s32k3xx_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
-static bool s32k3xx_unlock_address(target_flash_s *const flash, target_addr_t addr);
-static bool s32k3xx_flash_trigger_mcr(target_flash_s *const flash, uint32_t mcr_bits);
-static void s32k3xx_flash_prepare(target_flash_s *const flash);
-static void s32k3xx_reset(target_s *target);
+#define C40ASF_DATA_REG(x)         (0x402ec100U + (4U * (x)))
+#define C40ASF_SSPELOCK_REG(block) (PFCBLK0_SSPELOCK + (4U * (block)))
+#define C40ASF_SPELOCK_REG(block)  (PFCBLK0_SPELOCK + (4U * (block)))
 
 typedef struct s32k3xx_flash {
 	target_flash_s flash;
 	uint8_t block;
 } s32k3xx_flash_s;
+
+static bool s32k3xx_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
+static bool s32k3xx_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
+static bool s32k3xx_unlock_address(target_flash_s *flash, target_addr_t addr);
+static bool s32k3xx_flash_trigger_mcr(target_flash_s *flash, uint32_t mcr_bits);
+static void s32k3xx_flash_prepare(target_flash_s *flash);
+static void s32k3xx_reset(target_s *target);
 
 static void s32k3xx_add_flash(
 	target_s *const target, const uint32_t addr, const size_t length, const size_t erasesize, const uint8_t block)
@@ -117,7 +108,7 @@ static void s32k3xx_add_flash(
 bool s32k3xx_probe(target_s *const target)
 {
 	uint32_t midr1 = target_mem32_read32(target, SIUL2_MIDR1);
-	char product_letter = (midr1 >> 26U) & 0x3fU;
+	char product_letter = (char)((midr1 >> 26U) & 0x3fU);
 	uint32_t part_no = (midr1 >> 16U) & 0x3ffU;
 
 	if (product_letter != 0xbU)
@@ -135,6 +126,8 @@ bool s32k3xx_probe(target_s *const target)
 		s32k3xx_add_flash(target, 0x00700000U, 0x00100000U, 0x2000U, 3U);
 		s32k3xx_add_flash(target, 0x10000000U, 0x00020000U, 0x2000U, 4U);
 		break;
+	default:
+		break;
 	}
 	target->unsafe_enabled = false;
 	target->target_options |= TOPT_INHIBIT_NRST;
@@ -142,7 +135,7 @@ bool s32k3xx_probe(target_s *const target)
 	return true;
 }
 
-static bool s32k3xx_unlock_address(target_flash_s *const flash, target_addr_t addr)
+static bool s32k3xx_unlock_address(target_flash_s *const flash, const target_addr_t addr)
 {
 	s32k3xx_flash_s *const s32flash = (s32k3xx_flash_s *)flash;
 
@@ -152,7 +145,7 @@ static bool s32k3xx_unlock_address(target_flash_s *const flash, target_addr_t ad
 	if (flash->length < (256U * 1024U))
 		start_of_single_sectors = flash->start;
 	else
-		start_of_single_sectors = flash->start + flash->length - (256U * 1024U);
+		start_of_single_sectors = flash->start + flash->length - (target_addr_t)(256U * 1024U);
 
 	if (addr >= start_of_single_sectors) {
 		/* Use 8KB sectors */
@@ -174,7 +167,7 @@ static bool s32k3xx_unlock_address(target_flash_s *const flash, target_addr_t ad
 	return true;
 }
 
-static bool s32k3xx_flash_trigger_mcr(target_flash_s *const flash, uint32_t mcr_bits)
+static bool s32k3xx_flash_trigger_mcr(target_flash_s *const flash, const uint32_t mcr_bits)
 {
 	uint32_t mcr = target_mem32_read32(flash->t, C40ASF_MCR);
 	mcr |= mcr_bits;
@@ -232,7 +225,7 @@ static void s32k3xx_flash_prepare(target_flash_s *const flash)
 	target_mem32_write32(flash->t, C40ASF_MCRS, mcrs);
 }
 
-static bool s32k3xx_flash_erase(target_flash_s *const flash, target_addr_t addr, size_t len)
+static bool s32k3xx_flash_erase(target_flash_s *const flash, const target_addr_t addr, const size_t len)
 {
 	(void)len;
 	s32k3xx_flash_prepare(flash);
@@ -246,14 +239,15 @@ static bool s32k3xx_flash_erase(target_flash_s *const flash, target_addr_t addr,
 	return true;
 }
 
-static bool s32k3xx_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len)
+static bool s32k3xx_flash_write(
+	target_flash_s *flash, const target_addr_t dest, const void *const src, const size_t len)
 {
-	const uint32_t *const s_data = src;
+	const uint32_t *const data = src;
 	s32k3xx_flash_prepare(flash);
 	target_mem32_write32(flash->t, PFCPGM_PEADR_L, dest);
-	for (size_t i = 0; i < len; i += 4) {
+	for (size_t i = 0; i < len; i += 4U) {
 		const size_t word = i / 4;
-		target_mem32_write32(flash->t, C40ASF_DATA_REG(word), s_data[word]);
+		target_mem32_write32(flash->t, C40ASF_DATA_REG(word), data[word]);
 	}
 
 	if (!s32k3xx_flash_trigger_mcr(flash, C40ASF_MCR_PGM))

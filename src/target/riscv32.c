@@ -89,17 +89,20 @@ bool riscv32_probe(target_s *const target)
 	target->breakwatch_clear = riscv32_breakwatch_clear;
 
 	switch (target->designer_code) {
-	case JEP106_MANUFACTURER_RV_GIGADEVICE:
+	case JEP106_MANUFACTURER_ANDES:
 		PROBE(gd32vf1_probe);
+		break;
+	case JEP106_MANUFACTURER_NUCLEI:
+		PROBE(gd32vw5_probe);
 		break;
 	case JEP106_MANUFACTURER_RASPBERRY:
 		PROBE(rp2350_probe);
 		break;
-	default:
-		break;
 	case JEP106_MANUFACTURER_WCH:
 		PROBE(ch32v003x_probe);
 		PROBE(ch32vx_probe);
+		break;
+	default:
 		break;
 	}
 

@@ -91,10 +91,6 @@ typedef struct mspm0_flash {
 	uint32_t banks;
 } mspm0_flash_s;
 
-static bool mspm0_flash_erase(target_flash_s *flash, target_addr_t addr, size_t length);
-static bool mspm0_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t length);
-static bool mspm0_mass_erase(target_s *target, platform_timeout_s *print_progess);
-
 #if MSPM0_CONFIG_FLASH_DUMP_SUPPORT
 static bool mspm0_dump_factory_config(target_s *target, int argc, const char **argv);
 static bool mspm0_dump_bcr_config(target_s *target, int argc, const char **argv);
@@ -104,7 +100,13 @@ static command_s mspm0_cmds_list[] = {
 	{"dump_bcr", mspm0_dump_bcr_config, "Display NONMAIN (BCR/BSL) registers"},
 	{NULL, NULL, NULL},
 };
+#endif
 
+static bool mspm0_flash_erase(target_flash_s *flash, target_addr_t addr, size_t length);
+static bool mspm0_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t length);
+static bool mspm0_mass_erase(target_s *target, platform_timeout_s *print_progess);
+
+#if MSPM0_CONFIG_FLASH_DUMP_SUPPORT
 typedef struct conf_register {
 	uint16_t reg_offset;
 	uint16_t size_words;
@@ -155,12 +157,12 @@ static conf_register_s mspm0_bcr_regs[] = {
 	{0U, 0U, NULL},
 };
 
-static void mspm0_dump_regs(target_s *const target, const conf_register_s *regs, uint32_t base)
+static void mspm0_dump_regs(target_s *const target, const conf_register_s *const regs, const uint32_t base)
 {
 	for (const conf_register_s *reg = regs; reg->id; ++reg) {
 		tc_printf(target, "%15s: ", reg->id);
 		for (size_t i = 0; i < reg->size_words; ++i) {
-			uint32_t value = target_mem32_read32(target, base + reg->reg_offset + i * 4U);
+			uint32_t value = target_mem32_read32(target, base + reg->reg_offset + (uint32_t)(i * 4U));
 			tc_printf(target, "0x%08" PRIx32 "%s", value, i == reg->size_words - 1U ? "\n" : " ");
 		}
 	}
@@ -295,8 +297,6 @@ static bool mspm0_flash_erase(target_flash_s *const target_flash, const target_a
 
 	target_s *const target = target_flash->t;
 
-	DEBUG_INFO("%s: Erasing flash addr %08" PRIx32 " length %08" PRIx32 "\n", __func__, addr, (uint32_t)length);
-
 	mspm0_flash_unprotect_sector(target_flash, addr);
 	target_mem32_write32(
 		target, MSPM0_FLASHCTL_CMDTYPE, MSPM0_FLASHCTL_CMDTYPE_SZ_SECTOR | MSPM0_FLASHCTL_CMDTYPE_ERASE);
@@ -339,7 +339,7 @@ static bool mspm0_flash_write(
 	return status & MSPM0_FLASHCTL_STAT_CMDPASS;
 }
 
-static bool mspm0_mass_erase(target_s *target, platform_timeout_s *print_progess)
+static bool mspm0_mass_erase(target_s *const target, platform_timeout_s *const print_progess)
 {
 	bool success = true;
 	for (mspm0_flash_s *flash = (mspm0_flash_s *)target->flash; flash && success;

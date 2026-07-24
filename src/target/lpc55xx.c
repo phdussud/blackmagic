@@ -1,7 +1,7 @@
 /*
  * This file is part of the Black Magic Debug project.
  *
- * Copyright (C) 2022-2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2022-2025 1BitSquared <info@1bitsquared.com>
  * Written by Rachel Mant <git@dragonmux.network>
  * Based on prior work by Uwe Bones <bon@elektron.ikp.physik.tu-darmstadt.de>
  * All rights reserved.
@@ -32,19 +32,26 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * This file implements support for LPC55xx series devices, providing
+ * memory maps and Flash programming routines.
+ *
+ * References and details about the IAP variant used here:
+ * LPC55S0x/LPC550x 32-bit Arm Cortex®-M33, Product data sheet, Rev. 1.4
+ *   https://www.nxp.com/docs/en/data-sheet/LPC55S0x_LPC550x.pdf
+ * LPC55S1x/LPC551x 32-bit Arm Cortex®-M33, Product data sheet, Rev. 1.8
+ *   https://www.nxp.com/docs/en/nxp/data-sheets/LPC55S1x_LPC551x_DS.pdf
+ * and (behind their login wall):
+ * UM11424 - LPC55S0x/LPC550x User manual, Rev. 1.3
+ *   https://www.nxp.com/webapp/Download?colCode=UM11424&location=null
+ * UM11295 - LPC55S1x/LPC551x User manual, Rev. 1.7
+ *   https://www.nxp.com/webapp/Download?colCode=UM11295&location=null
+ */
+
 #include "general.h"
 #include "target.h"
 #include "target_internal.h"
 #include "cortexm.h"
-
-/*
- * For detailed documentation on how this code works and the IAP variant used here, see:
- * https://www.nxp.com/docs/en/data-sheet/LPC55S0x_LPC550x_DS.pdf
- * https://www.nxp.com/docs/en/nxp/data-sheets/LPC55S1x_LPC551x_DS.pdf
- * and (behind their login wall):
- * https://cache.nxp.com/secured/assets/documents/en/nxp/user-guides/UM11424.pdf?fileExt=.pdf
- * https://cache.nxp.com/secured/assets/documents/en/nxp/user-guides/UM11295.pdf?fileExt=.pdf
- */
 
 #define LPC55_DMAP_IDR                 0x002a0000U
 #define LPC55_DMAP_BULK_ERASE          0x02U
@@ -142,7 +149,32 @@ typedef enum lpc55xx_iap_status {
 	IAP_STATUS_FLASH_FFR_BANK_IS_LOCKED = 141,
 } lpc55xx_iap_status_e;
 
-static target_addr_t lpc55xx_get_bootloader_tree_address(target_s *target)
+typedef struct lpc55xx_flash_config {
+	uint32_t flash_block_base;
+	uint32_t flash_total_size;
+	uint32_t flash_block_count;
+	uint32_t flash_page_size;
+	uint32_t flash_sector_size;
+
+	uint32_t reserved0[5];
+	uint32_t sys_freq_mhz;
+	uint32_t reserved1[4];
+} lpc55xx_flash_config_s;
+
+static bool lpc55xx_read_uid(target_s *target, int argc, const char **argv);
+
+static const command_s lpc55xx_cmd_list[] = {
+	{"readuid", lpc55xx_read_uid, "Read out the 16-byte UID."},
+	{NULL, NULL, NULL},
+};
+
+static bool lpc55xx_flash_init(target_s *target, lpc55xx_flash_config_s *config);
+static bool lpc55xx_enter_flash_mode(target_s *target);
+static bool lpc55xx_flash_prepare(target_flash_s *flash);
+static bool lpc55xx_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
+static bool lpc55xx_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
+
+static target_addr32_t lpc55xx_get_bootloader_tree_address(target_s *const target)
 {
 	switch (target_mem32_read32(target, LPC55xx_CHIPID_ADDRESS)) {
 	//case LPC5512_CHIPID:
@@ -174,7 +206,7 @@ static target_addr_t lpc55xx_get_bootloader_tree_address(target_s *target)
 	}
 }
 
-static const char *lpc55xx_get_device_name(uint32_t chipid)
+static const char *lpc55xx_get_device_name(const uint32_t chipid)
 {
 	switch (chipid) {
 	case LPC5502_CHIPID:
@@ -205,67 +237,69 @@ static const char *lpc55xx_get_device_name(uint32_t chipid)
 	}
 }
 
-static int lpc55xx_get_rom_api_version(target_s *target, target_addr_t bootloader_tree_address)
+static int lpc55xx_get_rom_api_version(target_s *const target, const target_addr32_t bootloader_tree_address)
 {
 	return ((target_mem32_read32(target, bootloader_tree_address + 0x4) >> 16) & 0xff) == 3 ? 1 : 0;
 }
 
-static target_addr_t lpc55xx_get_flash_table_address(target_s *target, target_addr_t bootloader_tree_address)
+static target_addr32_t lpc55xx_get_flash_table_address(
+	target_s *const target, const target_addr32_t bootloader_tree_address)
 {
 	return target_mem32_read32(target, bootloader_tree_address + 0x10);
 }
 
-static target_addr_t lpc55xx_get_flash_init_address(target_s *target)
+static target_addr32_t lpc55xx_get_flash_init_address(target_s *const target)
 {
-	target_addr_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
+	const target_addr32_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
 
-	target_addr_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
+	const target_addr32_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
 	return target_mem32_read32(target, flash_table_address + sizeof(uint32_t));
 }
 
-static target_addr_t lpc55xx_get_flash_erase_address(target_s *target)
+static target_addr32_t lpc55xx_get_flash_erase_address(target_s *const target)
 {
-	target_addr_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
+	const target_addr32_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
 
 	if (lpc55xx_get_rom_api_version(target, bootloader_tree_address) == 0)
 		return 0x1300413bU; // UNTESTED: found in SDK, not referenced in UM
 
-	target_addr_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
-	return target_mem32_read32(target, flash_table_address + 2 * sizeof(uint32_t));
+	const target_addr32_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
+	return target_mem32_read32(target, flash_table_address + (2U * sizeof(uint32_t)));
 }
 
-static target_addr_t lpc55xx_get_flash_program_address(target_s *target)
+static target_addr32_t lpc55xx_get_flash_program_address(target_s *const target)
 {
-	target_addr_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
+	const target_addr32_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
 
 	if (lpc55xx_get_rom_api_version(target, bootloader_tree_address) == 0)
 		return 0x1300419dU; // UNTESTED: found in SDK, not referenced in UM
 
-	target_addr_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
-	return target_mem32_read32(target, flash_table_address + 3 * sizeof(uint32_t));
+	const target_addr32_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
+	return target_mem32_read32(target, flash_table_address + (3U * sizeof(uint32_t)));
 }
 
-static target_addr_t lpc55xx_get_ffr_init_address(target_s *target)
+static target_addr32_t lpc55xx_get_ffr_init_address(target_s *const target)
 {
-	target_addr_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
-	target_addr_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
+	const target_addr32_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
+	const target_addr32_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
 
 	if (lpc55xx_get_rom_api_version(target, bootloader_tree_address) == 0)
-		return target_mem32_read32(target, flash_table_address + 7 * sizeof(uint32_t));
-	return target_mem32_read32(target, flash_table_address + 10 * sizeof(uint32_t));
+		return target_mem32_read32(target, flash_table_address + (7U * sizeof(uint32_t)));
+	return target_mem32_read32(target, flash_table_address + (10U * sizeof(uint32_t)));
 }
 
-static target_addr_t lpc55xx_get_ffr_get_uuid_address(target_s *target)
+static target_addr32_t lpc55xx_get_ffr_get_uuid_address(target_s *const target)
 {
-	target_addr_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
-	target_addr_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
+	const target_addr32_t bootloader_tree_address = lpc55xx_get_bootloader_tree_address(target);
+	const target_addr32_t flash_table_address = lpc55xx_get_flash_table_address(target, bootloader_tree_address);
 
 	if (lpc55xx_get_rom_api_version(target, bootloader_tree_address) == 0)
-		return target_mem32_read32(target, flash_table_address + 10 * sizeof(uint32_t));
-	return target_mem32_read32(target, flash_table_address + 13 * sizeof(uint32_t));
+		return target_mem32_read32(target, flash_table_address + (10U * sizeof(uint32_t)));
+	return target_mem32_read32(target, flash_table_address + (13U * sizeof(uint32_t)));
 }
 
-static lpc55xx_iap_status_e iap_call_raw(target_s *target, lpc55xx_iap_cmd_e cmd, uint32_t r1, uint32_t r2, uint32_t r3)
+static lpc55xx_iap_status_e iap_call_raw(
+	target_s *const target, const lpc55xx_iap_cmd_e cmd, const uint32_t r1, const uint32_t r2, const uint32_t r3)
 {
 	/* Prepare the registers for the IAP call. R0 is always flash_config */
 	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT];
@@ -318,162 +352,9 @@ static lpc55xx_iap_status_e iap_call_raw(target_s *target, lpc55xx_iap_cmd_e cmd
 	return (lpc55xx_iap_status_e)regs[0];
 }
 
-typedef struct lpc55xx_flash_config {
-	uint32_t flash_block_base;
-	uint32_t flash_total_size;
-	uint32_t flash_block_count;
-	uint32_t flash_page_size;
-	uint32_t flash_sector_size;
-
-	uint32_t reserved0[5];
-	uint32_t sys_freq_mhz;
-	uint32_t reserved1[4];
-} lpc55xx_flash_config_s;
-
-static void lpc55xx_prepare_flash_config(target_s *target, target_addr_t address)
+static target_flash_s *lpc55xx_add_flash(target_s *const target)
 {
-	/*
-	 * The flash config structure is 60 bytes in size, zero it out as that
-	 * is what the SDK does. For some reason you have to fill in the clock
-	 * speed field ("sys_freq_mhz") before flash_init. Set it to 96MHz (?)
-	 */
-	lpc55xx_flash_config_s config = {
-		.sys_freq_mhz = LPC55xx_IAP_FREQ_IN_MHZ,
-	};
-
-	target_mem32_write(target, address, &config, sizeof(config));
-}
-
-static bool lpc55xx_flash_init(target_s *target, lpc55xx_flash_config_s *config)
-{
-	uint8_t backup_memory[LPC55xx_SCRATCH_MEMORY_LEN];
-	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT];
-
-	target_regs_read(target, regs);
-	target_mem32_read(target, backup_memory, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(backup_memory));
-
-	bool success = false;
-
-	lpc55xx_prepare_flash_config(target, LPC55xx_FLASH_CONFIG_ADDRESS);
-
-	const lpc55xx_iap_status_e status = iap_call_raw(target, IAP_CMD_FLASH_INIT, 0, 0, 0);
-	if (status != IAP_STATUS_FLASH_SUCCESS) {
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
-		goto exit;
-	}
-
-	target_mem32_read(target, config, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(*config));
-
-	success = true;
-
-exit:
-	target_mem32_write(target, LPC55xx_FLASH_CONFIG_ADDRESS, backup_memory, sizeof(backup_memory));
-	target_regs_write(target, regs);
-
-	return success;
-}
-
-static bool lpc55xx_get_uuid(target_s *target, uint8_t *uuid)
-{
-	uint8_t backup_memory[LPC55xx_SCRATCH_MEMORY_LEN + LPC55xx_UUID_LEN];
-	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT];
-
-	target_regs_read(target, regs);
-	target_mem32_read(target, backup_memory, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(backup_memory));
-
-	bool success = false;
-
-	lpc55xx_prepare_flash_config(target, LPC55xx_FLASH_CONFIG_ADDRESS);
-
-	lpc55xx_iap_status_e status = iap_call_raw(target, IAP_CMD_FLASH_INIT, 0, 0, 0);
-	if (status != IAP_STATUS_FLASH_SUCCESS) {
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
-		goto exit;
-	}
-
-	status = iap_call_raw(target, IAP_CMD_FFR_INIT, 0, 0, 0);
-	if (status != IAP_STATUS_FLASH_SUCCESS) {
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FFR_INIT], status);
-		goto exit;
-	}
-
-	status = iap_call_raw(target, IAP_CMD_FFR_GET_UUID, LPC55xx_UUID_ADDRESS, 0, 0);
-	if (status != IAP_STATUS_FLASH_SUCCESS) {
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FFR_GET_UUID], status);
-		goto exit;
-	}
-
-	target_mem32_read(target, uuid, LPC55xx_UUID_ADDRESS, LPC55xx_UUID_LEN);
-
-	success = true;
-
-exit:
-	target_mem32_write(target, LPC55xx_FLASH_CONFIG_ADDRESS, backup_memory, sizeof(backup_memory));
-	target_regs_write(target, regs);
-
-	return success;
-}
-
-static bool lpc55xx_enter_flash_mode(target_s *target)
-{
-	// NOTE! The usual way to go about this would be to just reset the target to
-	// put it back into a known state. Unfortunately target_reset hangs for this
-	// target and I'm not sure why, so the below is a viable workaround for now.
-
-	const uint32_t reg_pc_value = LPC55xx_CODE_PATCH_ADDRESS | 1;
-
-	// Execute a small binary patch which just disables interrupts and then hits
-	// a breakpoint, to allow the flash IAP calls to run undisturbed. This patch
-	// consists of the instructions CPSID I; BKPT; in ARM Thumb encoding.
-	const uint32_t CODE_PATCH = 0xbe00b672U;
-
-	target_mem32_write32(target, LPC55xx_CODE_PATCH_ADDRESS, CODE_PATCH);
-	target_reg_write(target, CORTEX_REG_PC, &reg_pc_value, sizeof(uint32_t));
-
-	target_halt_resume(target, false);
-	// Wait for the target to halt on the BKPT instruction
-	while (!target_halt_poll(target, NULL))
-		continue;
-
-	return true;
-}
-
-static bool lpc55xx_flash_prepare(target_flash_s *flash)
-{
-	lpc55xx_prepare_flash_config(flash->t, LPC55xx_FLASH_CONFIG_ADDRESS);
-
-	// Initialize the IAP flash context once in a predefined location
-	// of SRAM, the flash erase/write functions assume it is present.
-
-	const lpc55xx_iap_status_e status = iap_call_raw(flash->t, IAP_CMD_FLASH_INIT, 0, 0, 0);
-	if (status != IAP_STATUS_FLASH_SUCCESS)
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
-	return status == IAP_STATUS_FLASH_SUCCESS;
-}
-
-static bool lpc55xx_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len)
-{
-	const lpc55xx_iap_status_e status =
-		iap_call_raw(flash->t, IAP_CMD_FLASH_ERASE, addr, (uint32_t)len, LPC55xx_ERASE_KEY);
-	if (status != IAP_STATUS_FLASH_SUCCESS)
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_ERASE], status);
-	return status == IAP_STATUS_FLASH_SUCCESS;
-}
-
-static bool lpc55xx_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len)
-{
-	target_mem32_write(flash->t, LPC55xx_WRITE_BUFFER_ADDRESS, src, len);
-
-	const lpc55xx_iap_status_e status =
-		iap_call_raw(flash->t, IAP_CMD_FLASH_PROGRAM, dest, LPC55xx_WRITE_BUFFER_ADDRESS, (uint32_t)len);
-	if (status != IAP_STATUS_FLASH_SUCCESS)
-		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_PROGRAM], status);
-	return status == IAP_STATUS_FLASH_SUCCESS;
-}
-
-static target_flash_s *lpc55xx_add_flash(target_s *target)
-{
-	target_flash_s *flash = calloc(1, sizeof(*flash));
+	target_flash_s *const flash = calloc(1, sizeof(*flash));
 	if (!flash) { /* calloc failed: heap exhaustion */
 		DEBUG_ERROR("calloc: failed in %s\n", __func__);
 		return NULL;
@@ -512,62 +393,6 @@ static target_flash_s *lpc55xx_add_flash(target_s *target)
 	target_add_flash(target, flash);
 
 	return flash;
-}
-
-static bool lpc55xx_read_uid(target_s *target, int argc, const char *argv[])
-{
-	(void)argc;
-	(void)argv;
-
-	uint8_t uuid[LPC55xx_UUID_LEN];
-	if (!lpc55xx_get_uuid(target, uuid))
-		return false;
-
-	tc_printf(target, "UID: 0x");
-	for (size_t i = 0; i < sizeof(uuid); ++i)
-		tc_printf(target, "%02x", uuid[i]);
-	tc_printf(target, "\n");
-
-	return true;
-}
-
-static const command_s lpc55xx_cmd_list[] = {
-	{"readuid", lpc55xx_read_uid, "Read out the 16-byte UID."},
-	{NULL, NULL, NULL},
-};
-
-static bool lpc55_dmap_cmd(adiv5_access_port_s *ap, uint32_t cmd);
-static bool lpc55_dmap_mass_erase(target_s *target, platform_timeout_s *print_progess);
-static void lpc55_dmap_ap_free(void *priv);
-
-void lpc55_dp_prepare(adiv5_debug_port_s *const dp)
-{
-	/* Reading targetid again here upsets the LPC55 and STM32U5 */
-	/*
-	 * UM11126, 51.6.1
-	 * Debug session with uninitialized/invalid flash image or ISP mode
-	 */
-	adiv5_dp_abort(dp, ADIV5_DP_ABORT_DAPABORT);
-	/* Set up a dummy Access Port on the stack */
-	adiv5_access_port_s ap = {0};
-	ap.dp = dp;
-	ap.apsel = 2;
-	/* Read out the ID register and check it's the LPC55's Debug Mailbox ID */
-	ap.idr = adiv5_ap_read(&ap, ADIV5_AP_IDR);
-	if (ap.idr != LPC55_DMAP_IDR)
-		return; /* Return early if this likely is not an LPC55 */
-
-	/* Try reading out the AP 0 IDR */
-	ap.apsel = 0;
-	ap.idr = adiv5_ap_read(&ap, ADIV5_AP_IDR);
-	/* If that failed, then we have to activate the debug mailbox */
-	if (ap.idr == 0) {
-		DEBUG_INFO("Running LPC55 activation sequence\n");
-		ap.apsel = 2;
-		adiv5_ap_write(&ap, ADIV5_AP_CSW, 0x21);
-		lpc55_dmap_cmd(&ap, LPC55_DMAP_START_DEBUG_SESSION);
-	}
-	/* At this point we assume that we've got access to the debug mailbox and can continue normally. */
 }
 
 bool lpc55xx_probe(target_s *const target)
@@ -634,12 +459,204 @@ bool lpc55xx_probe(target_s *const target)
 	return true;
 }
 
-bool lpc55_dmap_probe(adiv5_access_port_s *ap)
+static void lpc55xx_prepare_flash_config(target_s *const target, const target_addr_t address)
+{
+	/*
+	 * The flash config structure is 60 bytes in size, zero it out as that
+	 * is what the SDK does. For some reason you have to fill in the clock
+	 * speed field ("sys_freq_mhz") before flash_init. Set it to 96MHz (?)
+	 */
+	lpc55xx_flash_config_s config = {
+		.sys_freq_mhz = LPC55xx_IAP_FREQ_IN_MHZ,
+	};
+
+	target_mem32_write(target, address, &config, sizeof(config));
+}
+
+static bool lpc55xx_flash_init(target_s *const target, lpc55xx_flash_config_s *const config)
+{
+	uint8_t backup_memory[LPC55xx_SCRATCH_MEMORY_LEN];
+	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT];
+
+	target_regs_read(target, regs);
+	target_mem32_read(target, backup_memory, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(backup_memory));
+
+	bool success = false;
+
+	lpc55xx_prepare_flash_config(target, LPC55xx_FLASH_CONFIG_ADDRESS);
+
+	const lpc55xx_iap_status_e status = iap_call_raw(target, IAP_CMD_FLASH_INIT, 0, 0, 0);
+	if (status != IAP_STATUS_FLASH_SUCCESS) {
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
+		goto exit;
+	}
+
+	target_mem32_read(target, config, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(*config));
+
+	success = true;
+
+exit:
+	target_mem32_write(target, LPC55xx_FLASH_CONFIG_ADDRESS, backup_memory, sizeof(backup_memory));
+	target_regs_write(target, regs);
+
+	return success;
+}
+
+static bool lpc55xx_get_uuid(target_s *const target, uint8_t *const uuid)
+{
+	uint8_t backup_memory[LPC55xx_SCRATCH_MEMORY_LEN + LPC55xx_UUID_LEN];
+	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT];
+
+	target_regs_read(target, regs);
+	target_mem32_read(target, backup_memory, LPC55xx_FLASH_CONFIG_ADDRESS, sizeof(backup_memory));
+
+	bool success = false;
+
+	lpc55xx_prepare_flash_config(target, LPC55xx_FLASH_CONFIG_ADDRESS);
+
+	lpc55xx_iap_status_e status = iap_call_raw(target, IAP_CMD_FLASH_INIT, 0, 0, 0);
+	if (status != IAP_STATUS_FLASH_SUCCESS) {
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
+		goto exit;
+	}
+
+	status = iap_call_raw(target, IAP_CMD_FFR_INIT, 0, 0, 0);
+	if (status != IAP_STATUS_FLASH_SUCCESS) {
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FFR_INIT], status);
+		goto exit;
+	}
+
+	status = iap_call_raw(target, IAP_CMD_FFR_GET_UUID, LPC55xx_UUID_ADDRESS, 0, 0);
+	if (status != IAP_STATUS_FLASH_SUCCESS) {
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FFR_GET_UUID], status);
+		goto exit;
+	}
+
+	target_mem32_read(target, uuid, LPC55xx_UUID_ADDRESS, LPC55xx_UUID_LEN);
+
+	success = true;
+
+exit:
+	target_mem32_write(target, LPC55xx_FLASH_CONFIG_ADDRESS, backup_memory, sizeof(backup_memory));
+	target_regs_write(target, regs);
+
+	return success;
+}
+
+static bool lpc55xx_enter_flash_mode(target_s *const target)
+{
+	// NOTE! The usual way to go about this would be to just reset the target to
+	// put it back into a known state. Unfortunately target_reset hangs for this
+	// target and I'm not sure why, so the below is a viable workaround for now.
+
+	const uint32_t reg_pc_value = LPC55xx_CODE_PATCH_ADDRESS | 1U;
+
+	// Execute a small binary patch which just disables interrupts and then hits
+	// a breakpoint, to allow the flash IAP calls to run undisturbed. This patch
+	// consists of the instructions CPSID I; BKPT; in ARM Thumb encoding.
+	target_mem32_write16(target, LPC55xx_CODE_PATCH_ADDRESS, 0xb672U);
+	target_mem32_write16(target, LPC55xx_CODE_PATCH_ADDRESS + 2U, CORTEX_THUMB_BREAKPOINT);
+	target_reg_write(target, CORTEX_REG_PC, &reg_pc_value, sizeof(uint32_t));
+
+	target_halt_resume(target, false);
+	// Wait for the target to halt on the BKPT instruction
+	while (!target_halt_poll(target, NULL))
+		continue;
+
+	return true;
+}
+
+static bool lpc55xx_flash_prepare(target_flash_s *const flash)
+{
+	lpc55xx_prepare_flash_config(flash->t, LPC55xx_FLASH_CONFIG_ADDRESS);
+
+	// Initialize the IAP flash context once in a predefined location
+	// of SRAM, the flash erase/write functions assume it is present.
+
+	const lpc55xx_iap_status_e status = iap_call_raw(flash->t, IAP_CMD_FLASH_INIT, 0, 0, 0);
+	if (status != IAP_STATUS_FLASH_SUCCESS)
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_INIT], status);
+	return status == IAP_STATUS_FLASH_SUCCESS;
+}
+
+static bool lpc55xx_flash_erase(target_flash_s *const flash, const target_addr_t addr, const size_t len)
+{
+	const lpc55xx_iap_status_e status =
+		iap_call_raw(flash->t, IAP_CMD_FLASH_ERASE, addr, (uint32_t)len, LPC55xx_ERASE_KEY);
+	if (status != IAP_STATUS_FLASH_SUCCESS)
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_ERASE], status);
+	return status == IAP_STATUS_FLASH_SUCCESS;
+}
+
+static bool lpc55xx_flash_write(
+	target_flash_s *const flash, const target_addr_t dest, const void *const src, const size_t len)
+{
+	target_mem32_write(flash->t, LPC55xx_WRITE_BUFFER_ADDRESS, src, len);
+
+	const lpc55xx_iap_status_e status =
+		iap_call_raw(flash->t, IAP_CMD_FLASH_PROGRAM, dest, LPC55xx_WRITE_BUFFER_ADDRESS, (uint32_t)len);
+	if (status != IAP_STATUS_FLASH_SUCCESS)
+		DEBUG_ERROR("LPC55xx: IAP error: %s (%d)\n", lpc55xx_iap_cmd_descr[IAP_CMD_FLASH_PROGRAM], status);
+	return status == IAP_STATUS_FLASH_SUCCESS;
+}
+
+static bool lpc55xx_read_uid(target_s *const target, const int argc, const char **const argv)
+{
+	(void)argc;
+	(void)argv;
+
+	uint8_t uuid[LPC55xx_UUID_LEN];
+	if (!lpc55xx_get_uuid(target, uuid))
+		return false;
+
+	tc_printf(target, "UID: 0x");
+	for (size_t i = 0; i < sizeof(uuid); ++i)
+		tc_printf(target, "%02x", uuid[i]);
+	tc_printf(target, "\n");
+
+	return true;
+}
+
+static bool lpc55_dmap_cmd(adiv5_access_port_s *ap, uint32_t cmd);
+static bool lpc55_dmap_mass_erase(target_s *target, platform_timeout_s *print_progess);
+static void lpc55_dmap_ap_free(void *priv);
+
+void lpc55_dp_prepare(adiv5_debug_port_s *const dp)
+{
+	/* Reading targetid again here upsets the LPC55 and STM32U5 */
+	/*
+	 * UM11126, 51.6.1
+	 * Debug session with uninitialized/invalid flash image or ISP mode
+	 */
+	adiv5_dp_abort(dp, ADIV5_DP_ABORT_DAPABORT);
+	/* Set up a dummy Access Port on the stack */
+	adiv5_access_port_s ap = {0};
+	ap.dp = dp;
+	ap.apsel = 2;
+	/* Read out the ID register and check it's the LPC55's Debug Mailbox ID */
+	ap.idr = adiv5_ap_read(&ap, ADIV5_AP_IDR);
+	if (ap.idr != LPC55_DMAP_IDR)
+		return; /* Return early if this likely is not an LPC55 */
+
+	/* Try reading out the AP 0 IDR */
+	ap.apsel = 0;
+	ap.idr = adiv5_ap_read(&ap, ADIV5_AP_IDR);
+	/* If that failed, then we have to activate the debug mailbox */
+	if (ap.idr == 0) {
+		DEBUG_INFO("Running LPC55 activation sequence\n");
+		ap.apsel = 2;
+		adiv5_ap_write(&ap, ADIV5_AP_CSW, 0x21);
+		lpc55_dmap_cmd(&ap, LPC55_DMAP_START_DEBUG_SESSION);
+	}
+	/* At this point we assume that we've got access to the debug mailbox and can continue normally. */
+}
+
+bool lpc55_dmap_probe(adiv5_access_port_s *const ap)
 {
 	if (ap->idr != LPC55_DMAP_IDR)
 		return false;
 
-	target_s *target = target_new();
+	target_s *const target = target_new();
 	if (!target)
 		return false;
 
@@ -655,7 +672,7 @@ bool lpc55_dmap_probe(adiv5_access_port_s *ap)
 	return true;
 }
 
-static void lpc55_dmap_ap_free(void *priv)
+static void lpc55_dmap_ap_free(void *const priv)
 {
 	adiv5_ap_unref(priv);
 }

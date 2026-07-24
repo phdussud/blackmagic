@@ -2,7 +2,7 @@
  * This file is part of the Black Magic Debug project.
  *
  * Copyright (C) 2017 newbrain <federico.zuccardimerli@gmail.com>
- * Copyright (C) 2022-2023 1BitSquared <info@1bitsquared.com>
+ * Copyright (C) 2022-2025 1BitSquared <info@1bitsquared.com>
  * Modified by Rachel Mant <git@dragonmux.network>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -20,18 +20,13 @@
  */
 
 /*
- * This file implements MSP432 target specific functions for detecting
- * the device, providing the XML memory map and Flash memory programming.
+ * This file implements support for MSP432P4 series devices, providing
+ * memory maps and Flash programming routines.
  *
  * References:
- * TI doc - SLAU356G
- *   MSP432P4xx Technical Reference Manual
- * TI doc - SLAS826G
- *   MSP432P401R, MSP432P401M SimpleLink Mixed-Signal Microcontrollers
- * TI doc - SLAA704
- *   Flash Operations on MSP432 MCUs
- * TI doc -
- *   MSP432® Peripheral Driver Library User's Guide
+ * SLAU356G - MSP432P4xx Technical Reference Manual
+ * SLAS826G - MSP432P401R, MSP432P401M SimpleLink Mixed-Signal Microcontrollers
+ * SLAA704 - Flash Operations on MSP432 MCUs
  */
 
 #include "general.h"
@@ -108,31 +103,11 @@ typedef struct msp432_flash {
 	target_addr_t flash_program_fn;       /* Flash programming routine in ROM */
 } msp432_flash_s;
 
-static bool msp432_sector_erase(target_flash_s *f, target_addr_t addr);
-static bool msp432_flash_erase(target_flash_s *f, target_addr_t addr, size_t len);
-static bool msp432_flash_write(target_flash_s *f, target_addr_t dest, const void *src, size_t len);
-
-/* Call a function in the MSP432 ROM (or anywhere else...)*/
-static void msp432_call_rom(target_s *t, uint32_t address, uint32_t *regs);
-
-/* Protect or unprotect the sector containing address */
-static inline uint32_t msp432_sector_unprotect(msp432_flash_s *mf, target_addr_t addr)
-{
-	/* Read the old protection register */
-	uint32_t old_mask = target_mem32_read32(mf->f.t, mf->flash_protect_register);
-	/* Find the bit representing the sector and set it to 0  */
-	uint32_t sec_mask = ~(1U << ((addr - mf->f.start) / SECTOR_SIZE));
-	/* Clear the potection bit */
-	sec_mask &= old_mask;
-	target_mem32_write32(mf->f.t, mf->flash_protect_register, sec_mask);
-	return old_mask;
-}
-
 /* Optional commands handlers */
 /* Erase all of main flash */
-static bool msp432_cmd_erase_main(target_s *t, int argc, const char **argv);
+static bool msp432_cmd_erase_main(target_s *target, int argc, const char **argv);
 /* Erase a single (4KB) sector */
-static bool msp432_cmd_sector_erase(target_s *t, int argc, const char **argv);
+static bool msp432_cmd_sector_erase(target_s *target, int argc, const char **argv);
 
 /* Optional commands structure*/
 const command_s msp432_cmd_list[] = {
@@ -141,62 +116,69 @@ const command_s msp432_cmd_list[] = {
 	{NULL, NULL, NULL},
 };
 
-static void msp432_add_flash(target_s *t, uint32_t addr, size_t length, target_addr_t prot_reg)
+static bool msp432_sector_erase(const target_flash_s *target_flash, target_addr_t addr);
+static bool msp432_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
+static bool msp432_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
+
+/* Call a function in the MSP432 ROM (or anywhere else...)*/
+static void msp432_call_rom(target_s *target, uint32_t address, uint32_t *regs);
+
+static void msp432_add_flash(
+	target_s *const target, const uint32_t addr, const size_t length, const target_addr_t prot_reg)
 {
-	msp432_flash_s *mf = calloc(1, sizeof(*mf));
-	target_flash_s *f;
-	if (!mf) { /* calloc failed: heap exhaustion */
+	msp432_flash_s *flash = calloc(1, sizeof(*flash));
+	if (!flash) { /* calloc failed: heap exhaustion */
 		DEBUG_ERROR("calloc: failed in %s\n", __func__);
 		return;
 	}
 
-	f = &mf->f;
-	f->start = addr;
-	f->length = length;
-	f->blocksize = SECTOR_SIZE;
-	f->erase = msp432_flash_erase;
-	f->write = msp432_flash_write;
-	f->writesize = SRAM_WRITE_BUF_SIZE;
-	f->erased = 0xff;
-	target_add_flash(t, f);
+	target_flash_s *target_flash = &flash->f;
+	target_flash->start = addr;
+	target_flash->length = length;
+	target_flash->blocksize = SECTOR_SIZE;
+	target_flash->erase = msp432_flash_erase;
+	target_flash->write = msp432_flash_write;
+	target_flash->writesize = SRAM_WRITE_BUF_SIZE;
+	target_flash->erased = 0xff;
+	target_add_flash(target, target_flash);
 	/* Initialize ROM call pointers. Silicon rev B is not supported */
-	const uint32_t flash_ctrl_base = target_mem32_read32(t, ROM_TABLE_BASE + OFFS_FLASH_CTRL_TABLE);
-	mf->flash_erase_sector_fn = target_mem32_read32(t, flash_ctrl_base + OFFS_FLASH_CTRL_ERASE_SECTOR);
-	mf->flash_program_fn = target_mem32_read32(t, flash_ctrl_base + OFFS_FLASH_CTRL_PROGRAM_MEM);
-	mf->flash_protect_register = prot_reg;
+	const uint32_t flash_ctrl_base = target_mem32_read32(target, ROM_TABLE_BASE + OFFS_FLASH_CTRL_TABLE);
+	flash->flash_erase_sector_fn = target_mem32_read32(target, flash_ctrl_base + OFFS_FLASH_CTRL_ERASE_SECTOR);
+	flash->flash_program_fn = target_mem32_read32(target, flash_ctrl_base + OFFS_FLASH_CTRL_PROGRAM_MEM);
+	flash->flash_protect_register = prot_reg;
 }
 
-bool msp432p4_probe(target_s *t)
+bool msp432p4_probe(target_s *const target)
 {
 	/* Check for the right device info tag in the TLV ROM structure */
-	if (target_mem32_read32(t, DEVINFO_TAG_ADDR) != DEVINFO_TAG_VALUE)
+	if (target_mem32_read32(target, DEVINFO_TAG_ADDR) != DEVINFO_TAG_VALUE)
 		return false;
 
 	/* Check for the right device info length tag in the TLV ROM structure */
-	if (target_mem32_read32(t, DEVINFO_LEN_ADDR) != DEVINFO_LEN_VALUE)
+	if (target_mem32_read32(target, DEVINFO_LEN_ADDR) != DEVINFO_LEN_VALUE)
 		return false;
 
 	/* Check for the right HW revision: at least C, as no flash support for B */
-	if (target_mem32_read32(t, HWREV_ADDR) < HWREV_MIN_VALUE) {
+	if (target_mem32_read32(target, HWREV_ADDR) < HWREV_MIN_VALUE) {
 		DEBUG_INFO("MSP432 Version not handled\n");
 		return false;
 	}
 
 	/* If we got till this point, we are most probably looking at a real TLV  */
 	/* Device Information structure. Now check for the correct device         */
-	switch (target_mem32_read32(t, DEVID_ADDR)) {
+	switch (target_mem32_read32(target, DEVID_ADDR)) {
 	case DEVID_MSP432P401RIPZ:
 	case DEVID_MSP432P401RIZXH:
 	case DEVID_MSP432P401RIRGC:
 		/* R series: 256kB Flash, 64kB RAM */
-		t->driver = "MSP432P401R 256KB Flash 64KB RAM";
+		target->driver = "MSP432P401R 256KB Flash 64KB RAM";
 		break;
 
 	case DEVID_MSP432P401MIPZ:
 	case DEVID_MSP432P401MIZXH:
 	case DEVID_MSP432P401MIRGC:
 		/* M series: 128kB Flash, 32kB RAM */
-		t->driver = "MSP432P401M 128KB Flash 32KB RAM";
+		target->driver = "MSP432P401M 128KB Flash 32KB RAM";
 		break;
 
 	default:
@@ -204,166 +186,166 @@ bool msp432p4_probe(target_s *t)
 		return false;
 	}
 	/* SRAM region, SRAM zone */
-	target_add_ram32(t, SRAM_BASE, target_mem32_read32(t, SYS_SRAM_SIZE));
+	target_add_ram32(target, SRAM_BASE, target_mem32_read32(target, SYS_SRAM_SIZE));
 	/* Flash bank size */
-	uint32_t banksize = target_mem32_read32(t, SYS_FLASH_SIZE) / 2U;
+	uint32_t banksize = target_mem32_read32(target, SYS_FLASH_SIZE) / 2U;
 	/* Main Flash Bank 0 */
-	msp432_add_flash(t, MAIN_FLASH_BASE, banksize, MAIN_BANK0_WEPROT);
+	msp432_add_flash(target, MAIN_FLASH_BASE, banksize, MAIN_BANK0_WEPROT);
 	/* Main Flash Bank 1 */
-	msp432_add_flash(t, MAIN_FLASH_BASE + banksize, banksize, MAIN_BANK1_WEPROT);
+	msp432_add_flash(target, MAIN_FLASH_BASE + banksize, banksize, MAIN_BANK1_WEPROT);
 	/* Info Flash Bank 0 */
-	msp432_add_flash(t, INFO_FLASH_BASE, INFO_BANK_SIZE, INFO_BANK0_WEPROT);
+	msp432_add_flash(target, INFO_FLASH_BASE, INFO_BANK_SIZE, INFO_BANK0_WEPROT);
 	/* Info Flash Bank 1 */
-	msp432_add_flash(t, INFO_FLASH_BASE + INFO_BANK_SIZE, INFO_BANK_SIZE, INFO_BANK1_WEPROT);
+	msp432_add_flash(target, INFO_FLASH_BASE + INFO_BANK_SIZE, INFO_BANK_SIZE, INFO_BANK1_WEPROT);
 
 	/* Connect the optional commands */
-	target_add_commands(t, msp432_cmd_list, "MSP432P401x");
+	target_add_commands(target, msp432_cmd_list, "MSP432P401x");
 
 	/* All done */
 	return true;
 }
 
+/* Protect or unprotect the sector containing address */
+static inline uint32_t msp432_sector_unprotect(const msp432_flash_s *const flash, const target_addr_t addr)
+{
+	/* Read the old protection register */
+	uint32_t old_mask = target_mem32_read32(flash->f.t, flash->flash_protect_register);
+	/* Find the bit representing the sector and set it to 0  */
+	uint32_t sec_mask = ~(1U << ((addr - flash->f.start) / SECTOR_SIZE));
+	/* Clear the potection bit */
+	sec_mask &= old_mask;
+	target_mem32_write32(flash->f.t, flash->flash_protect_register, sec_mask);
+	return old_mask;
+}
+
 /* Flash operations */
 /* Erase a single sector at addr calling the ROM routine*/
-static bool msp432_sector_erase(target_flash_s *f, target_addr_t addr)
+static bool msp432_sector_erase(const target_flash_s *const target_flash, const target_addr_t addr)
 {
-	target_s *t = f->t;
-	msp432_flash_s *mf = (msp432_flash_s *)f;
+	target_s *target = target_flash->t;
+	const msp432_flash_s *const flash = (const msp432_flash_s *)target_flash;
 
 	/* Unprotect sector */
-	uint32_t old_prot = msp432_sector_unprotect(mf, addr);
-	DEBUG_WARN("Flash protect: 0x%08" PRIX32 "\n", target_mem32_read32(t, mf->flash_protect_register));
+	uint32_t old_prot = msp432_sector_unprotect(flash, addr);
+	DEBUG_WARN("Flash protect: 0x%08" PRIX32 "\n", target_mem32_read32(target, flash->flash_protect_register));
 
 	/* Prepare input data */
 	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT];
-	target_regs_read(t, regs);
+	target_regs_read(target, regs);
 	regs[0] = addr; // Address of sector to erase in R0
 
-	DEBUG_INFO("Erasing sector at 0x%08" PRIX32 "\n", addr);
-
 	/* Call ROM */
-	msp432_call_rom(t, mf->flash_erase_sector_fn, regs);
+	msp432_call_rom(target, flash->flash_erase_sector_fn, regs);
 
 	// Result value in R0 is true for success
-	DEBUG_INFO("ROM return value: %" PRIu32 "\n", regs[0]);
+	DEBUG_TARGET("ROM return value: %" PRIu32 "\n", regs[0]);
 
 	/* Restore original protection */
-	target_mem32_write32(t, mf->flash_protect_register, old_prot);
+	target_mem32_write32(target, flash->flash_protect_register, old_prot);
 	return regs[0] != 0;
 }
 
 /* Erase from addr for len bytes */
-static bool msp432_flash_erase(target_flash_s *f, target_addr_t addr, size_t len)
+static bool msp432_flash_erase(target_flash_s *const flash, const target_addr_t addr, const size_t len)
 {
-	bool ret = true;
-	while (len) {
-		ret &= msp432_sector_erase(f, addr);
-
-		/* update len and addr */
-		len -= f->blocksize;
-		if (len > f->blocksize)
-			len -= f->blocksize;
-		else
-			len = 0;
-	}
-
-	return ret;
+	(void)len;
+	return msp432_sector_erase(flash, addr);
 }
 
 /* Program flash */
-static bool msp432_flash_write(target_flash_s *f, target_addr_t dest, const void *src, size_t len)
+static bool msp432_flash_write(
+	target_flash_s *const flash, const target_addr_t dest, const void *const src, const size_t len)
 {
-	msp432_flash_s *mf = (msp432_flash_s *)f;
-	target_s *t = f->t;
+	msp432_flash_s *mf = (msp432_flash_s *)flash;
+	target_s *target = flash->t;
 
 	/* Prepare RAM buffer in target */
-	target_mem32_write(t, SRAM_WRITE_BUFFER, src, len);
+	target_mem32_write(target, SRAM_WRITE_BUFFER, src, len);
 
 	/* Unprotect sector, len is always < SECTOR_SIZE */
 	uint32_t old_prot = msp432_sector_unprotect(mf, dest);
 
-	DEBUG_WARN("Flash protect: 0x%08" PRIX32 "\n", target_mem32_read32(t, mf->flash_protect_register));
+	DEBUG_WARN("Flash protect: 0x%08" PRIX32 "\n", target_mem32_read32(target, mf->flash_protect_register));
 
 	/* Prepare input data */
-	uint32_t *regs = alloca(t->regs_size / sizeof(uint32_t)); // Use of VLA
-	target_regs_read(t, regs);
+	uint32_t regs[CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT];
+	target_regs_read(target, regs);
 	regs[0] = SRAM_WRITE_BUFFER; // Address of buffer to be flashed in R0
 	regs[1] = dest;              // Flash address to be write to in R1
 	regs[2] = len;               // Size of buffer to be flashed in R2
 
-	DEBUG_INFO("Writing 0x%04" PRIX32 " bytes at 0x%08zu\n", dest, len);
 	/* Call ROM */
-	msp432_call_rom(t, mf->flash_program_fn, regs);
+	msp432_call_rom(target, mf->flash_program_fn, regs);
 
 	/* Restore original protection */
-	target_mem32_write32(t, mf->flash_protect_register, old_prot);
+	target_mem32_write32(target, mf->flash_protect_register, old_prot);
 
-	DEBUG_INFO("ROM return value: %" PRIu32 "\n", regs[0]);
+	DEBUG_TARGET("ROM return value: %" PRIu32 "\n", regs[0]);
 
 	// Result value in R0 is true for success
 	return regs[0] != 0;
 }
 
 /* Optional commands handlers */
-static bool msp432_cmd_erase_main(target_s *t, int argc, const char **argv)
+static bool msp432_cmd_erase_main(target_s *const target, const int argc, const char **const argv)
 {
 	(void)argc;
 	(void)argv;
 	/* The mass erase routine in ROM will also erase the Info Flash. */
 	/* Usually, this is not wanted, so go sector by sector...        */
 
-	uint32_t banksize = target_mem32_read32(t, SYS_FLASH_SIZE) / 2U;
-	DEBUG_INFO("Bank Size: 0x%08" PRIX32 "\n", banksize);
+	uint32_t banksize = target_mem32_read32(target, SYS_FLASH_SIZE) / 2U;
+	DEBUG_TARGET("Bank Size: 0x%08" PRIX32 "\n", banksize);
 
 	bool result = true;
 
 	/* Erase first bank */
-	target_flash_s *f = target_flash_for_addr(t, MAIN_FLASH_BASE);
-	result &= msp432_flash_erase(f, MAIN_FLASH_BASE, banksize);
+	target_flash_s *flash = target_flash_for_addr(target, MAIN_FLASH_BASE);
+	result &= msp432_flash_erase(flash, MAIN_FLASH_BASE, banksize);
 
 	/* Erase second bank */
-	f = target_flash_for_addr(t, MAIN_FLASH_BASE + banksize);
-	result &= msp432_flash_erase(f, MAIN_FLASH_BASE + banksize, banksize);
+	flash = target_flash_for_addr(target, MAIN_FLASH_BASE + banksize);
+	result &= msp432_flash_erase(flash, MAIN_FLASH_BASE + banksize, banksize);
 
 	return result;
 }
 
-static bool msp432_cmd_sector_erase(target_s *t, int argc, const char **argv)
+static bool msp432_cmd_sector_erase(target_s *const target, const int argc, const char **const argv)
 {
 	if (argc < 2)
-		tc_printf(t, "usage: monitor sector_erase <addr>\n");
+		tc_printf(target, "usage: monitor sector_erase <addr>\n");
 
 	uint32_t addr = strtoul(argv[1], NULL, 0);
 
 	/* Find the flash structure (for the right protect register) */
-	target_flash_s *f = target_flash_for_addr(t, addr);
+	target_flash_s *flash = target_flash_for_addr(target, addr);
 
-	if (f)
-		return msp432_sector_erase(f, addr);
-	tc_printf(t, "Invalid sector address\n");
+	if (flash)
+		return msp432_sector_erase(flash, addr);
+	tc_printf(target, "Invalid sector address\n");
 	return false;
 }
 
 /* MSP432 ROM routine invocation */
-static void msp432_call_rom(target_s *t, uint32_t address, uint32_t *regs)
+static void msp432_call_rom(target_s *const target, const uint32_t address, uint32_t *const regs)
 {
 	/* Kill watchdog */
-	target_mem32_write16(t, WDT_A_WTDCTL, WDT_A_HOLD);
+	target_mem32_write16(target, WDT_A_WTDCTL, WDT_A_HOLD);
 
 	/* Breakpoint at the beginning of CODE SRAM alias area */
-	target_mem32_write16(t, SRAM_CODE_BASE, CORTEX_THUMB_BREAKPOINT);
+	target_mem32_write16(target, SRAM_CODE_BASE, CORTEX_THUMB_BREAKPOINT);
 
 	/* Prepare registers */
 	regs[CORTEX_REG_MSP] = SRAM_STACK_PTR;     /* Stack space */
 	regs[CORTEX_REG_LR] = SRAM_CODE_BASE | 1U; /* Return to beginning of SRAM CODE alias */
 	regs[CORTEX_REG_PC] = address;             /* Start at given address */
-	target_regs_write(t, regs);
+	target_regs_write(target, regs);
 
 	/* Start the target and wait for it to halt again, which calls the routine setup above */
-	target_halt_resume(t, false);
-	while (!target_halt_poll(t, NULL))
+	target_halt_resume(target, false);
+	while (!target_halt_poll(target, NULL))
 		continue;
 
 	// Read registers to get result
-	target_regs_read(t, regs);
+	target_regs_read(target, regs);
 }

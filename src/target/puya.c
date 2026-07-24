@@ -38,9 +38,6 @@
 #include "adiv5.h"
 #include "buffer_utils.h"
 
-/* Chip IDs */
-#define ID_PY32F07X 0x06188061U
-
 /* Flash */
 #define PUYA_FLASH_START         0x08000000U
 #define PUYA_00A_FLASH_PAGE_SIZE 128U
@@ -109,16 +106,16 @@
 #define PUYA_DBG_BASE   0x40015800U
 #define PUYA_DBG_IDCODE (PUYA_DBG_BASE + 0x00U)
 
-/*
- * Flash functions
- */
+/* Chip IDs */
+#define ID_PY32F07X 0x06188061U
+
 static bool puya_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len);
 static bool puya_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
 static bool puya_00a_flash_prepare(target_flash_s *flash);
 static bool puya_07x_flash_prepare(target_flash_s *flash);
 static bool puya_flash_done(target_flash_s *flash);
 
-bool puya_probe(target_s *target)
+bool puya_probe(target_s *const target)
 {
 	uint32_t ram_size = 0U;
 	size_t flash_size = 0U;
@@ -143,7 +140,7 @@ bool puya_probe(target_s *target)
 		return false;
 	}
 
-	target_flash_s *flash = calloc(1, sizeof(*flash));
+	target_flash_s *const flash = calloc(1, sizeof(*flash));
 	if (!flash) { /* calloc failed: heap exhaustion */
 		DEBUG_ERROR("calloc: failed in %s\n", __func__);
 		return false;
@@ -169,7 +166,7 @@ bool puya_probe(target_s *target)
 	return true;
 }
 
-static bool puya_00a_flash_prepare(target_flash_s *flash)
+static bool puya_00a_flash_prepare(target_flash_s *const flash)
 {
 	target_mem32_write32(flash->t, PUYA_FLASH_KEYR, PUYA_FLASH_KEYR_KEY1);
 	target_mem32_write32(flash->t, PUYA_FLASH_KEYR, PUYA_FLASH_KEYR_KEY2);
@@ -183,7 +180,7 @@ static bool puya_00a_flash_prepare(target_flash_s *flash)
 	uint32_t eppara[5] = {0};
 
 	for (uint16_t i = 0; i < 5; i++) {
-		eppara[i] = target_mem32_read32(flash->t, PUYA_00A_FLASH_TIMING_CAL_BASE + hsi_fs * 20 + i * 4U);
+		eppara[i] = target_mem32_read32(flash->t, PUYA_00A_FLASH_TIMING_CAL_BASE + (hsi_fs * 20) + (i * 4U));
 		DEBUG_TARGET("PY32 flash timing cal %u: %08" PRIx32 "\n", i, eppara[i]);
 	}
 
@@ -200,21 +197,23 @@ static bool puya_00a_flash_prepare(target_flash_s *flash)
 	return true;
 }
 
-static bool puya_07x_flash_prepare(target_flash_s *flash)
+static bool puya_07x_flash_prepare(target_flash_s *const flash)
 {
 	target_mem32_write32(flash->t, PUYA_FLASH_KEYR, PUYA_FLASH_KEYR_KEY1);
 	target_mem32_write32(flash->t, PUYA_FLASH_KEYR, PUYA_FLASH_KEYR_KEY2);
 
+#ifndef DEBUG_TARGET_IS_NOOP
 	uint8_t hsi_fs =
 		(target_mem32_read32(flash->t, PUYA_RCC_ICSCR) >> PUYA_RCC_ICSCR_HSI_FS_SHIFT) & PUYA_RCC_ICSCR_HSI_FS_MASK;
 	if (hsi_fs > 4)
 		hsi_fs = 0;
+#endif
 	DEBUG_TARGET("HSI frequency selection is %d\n", hsi_fs);
 
 	uint32_t eppara[5] = {0};
 
 	for (uint16_t i = 0; i < 5; i++) {
-		eppara[i] = target_mem32_read32(flash->t, PUYA_07X_FLASH_TIMING_CAL_BASE + 4 * 0x28 + i * 8U);
+		eppara[i] = target_mem32_read32(flash->t, PUYA_07X_FLASH_TIMING_CAL_BASE + (4 * 0x28) + (i * 8U));
 		DEBUG_TARGET("PY32 flash timing cal %u: %08" PRIx32 "\n", i, eppara[i]);
 	}
 
@@ -231,7 +230,7 @@ static bool puya_07x_flash_prepare(target_flash_s *flash)
 	return true;
 }
 
-static bool puya_flash_done(target_flash_s *flash)
+static bool puya_flash_done(target_flash_s *const flash)
 {
 	target_mem32_write32(flash->t, PUYA_FLASH_CR, PUYA_FLASH_CR_LOCK);
 	return true;
@@ -256,7 +255,7 @@ static bool puya_check_flash_no_error(target_s *const target)
 	return !((status & PUYA_FLASH_SR_WRPERR));
 }
 
-static bool puya_flash_erase(target_flash_s *flash, target_addr_t addr, size_t len)
+static bool puya_flash_erase(target_flash_s *const flash, const target_addr_t addr, const size_t len)
 {
 	(void)len;
 	target_mem32_write32(flash->t, PUYA_FLASH_CR, PUYA_FLASH_CR_PER);
@@ -266,7 +265,8 @@ static bool puya_flash_erase(target_flash_s *flash, target_addr_t addr, size_t l
 	return puya_check_flash_no_error(flash->t);
 }
 
-static bool puya_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len)
+static bool puya_flash_write(
+	target_flash_s *const flash, const target_addr_t dest, const void *const src, const size_t len)
 {
 	target_mem32_write32(flash->t, PUYA_FLASH_CR, PUYA_FLASH_CR_PG);
 	for (size_t i = 0; i < len; i += 4) {
